@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (must already exist)"
+        description: "Tag to create (on the selected branch's head) and release, e.g. v0.1.0"
         required: true
 
 permissions:
@@ -30,8 +30,6 @@ jobs:
           - { target: x86_64-pc-windows-msvc, os: windows-latest, tool: cargo }
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -76,6 +74,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
           name: factuio ${{ env.TAG }}
           generate_release_notes: true
           files: dist/*
