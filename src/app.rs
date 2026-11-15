@@ -42,6 +42,31 @@ pub enum Modal {
     },
     Stats,
     Victory,
+    /// Message history.
+    Log {
+        scroll: u16,
+    },
+    /// A yes/no question before something that loses progress.
+    Confirm {
+        action: ConfirmAction,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ConfirmAction {
+    LoadSave,
+    QuitWithoutSaving,
+}
+
+impl ConfirmAction {
+    pub fn question(self) -> &'static str {
+        match self {
+            ConfirmAction::LoadSave => "Load the last save? Progress since then will be lost.",
+            ConfirmAction::QuitWithoutSaving => {
+                "Quit without saving? Progress since the last save will be lost."
+            }
+        }
+    }
 }
 
 pub const MENU_ITEMS: [&str; 6] = [
@@ -92,8 +117,31 @@ impl App {
         }
     }
 
+    /// Where autosaves (and emergency saves on Ctrl+C or a closed terminal) go,
+    /// so they never overwrite a save the player made on purpose.
+    pub fn autosave_path(&self) -> PathBuf {
+        let stem = self
+            .save_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "save".into());
+        self.save_path
+            .with_file_name(format!("{stem}.autosave.json"))
+    }
+
     pub fn save_exists(&self) -> bool {
-        self.save_path.exists()
+        self.save_path.exists() || self.autosave_path().exists()
+    }
+
+    /// The most recently written of the main save and the autosave.
+    pub fn newest_save(&self) -> PathBuf {
+        let mtime = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let auto = self.autosave_path();
+        match (mtime(&self.save_path), mtime(&auto)) {
+            (Some(a), Some(b)) if b > a => auto,
+            (None, Some(_)) => auto,
+            _ => self.save_path.clone(),
+        }
     }
 
     pub fn title_items(&self) -> Vec<&'static str> {
@@ -128,8 +176,20 @@ impl App {
         self.paused = false;
     }
 
+    /// Loads the main save (F9, menu Load).
     pub fn load_game(&mut self) -> Result<(), String> {
         let g = Game::load(&self.save_path)?;
+        self.start(g);
+        Ok(())
+    }
+
+    /// Loads whichever of the main save and the autosave is newer (Continue, --continue).
+    pub fn continue_game(&mut self) -> Result<(), String> {
+        let path = self.newest_save();
+        let mut g = Game::load(&path)?;
+        if path != self.save_path {
+            g.log("Continued from the autosave.");
+        }
         self.start(g);
         Ok(())
     }
@@ -143,6 +203,25 @@ impl App {
                     self.last_autosave_tick = g.world.tick;
                 }
                 Err(e) => g.log(format!("Save failed: {e}")),
+            }
+        }
+    }
+
+    /// Saves to the autosave slot. Returns false if that failed.
+    pub fn autosave(&mut self) -> bool {
+        let path = self.autosave_path();
+        let Some(g) = self.game.as_mut() else {
+            return true;
+        };
+        match g.save(&path) {
+            Ok(()) => {
+                g.log("Autosaved.");
+                self.last_autosave_tick = g.world.tick;
+                true
+            }
+            Err(e) => {
+                g.log(format!("Autosave failed: {e}"));
+                false
             }
         }
     }
@@ -173,15 +252,13 @@ impl App {
         }
         let tps = crate::world::TICKS_PER_SEC as u64;
         if g.world.tick >= self.last_autosave_tick + AUTOSAVE_SECS * tps {
-            self.save_game();
+            self.autosave();
         }
     }
 
     pub fn handle_key(&mut self, k: KeyEvent) {
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-            if self.game.is_some() {
-                self.save_game();
-            }
+            self.autosave();
             self.quit = true;
             return;
         }
@@ -217,12 +294,57 @@ impl App {
             Modal::Research { sel } => self.research_key(k, sel),
             Modal::Entity { x, y, sub, sel } => self.entity_key(k, x, y, sub, sel),
             Modal::Menu { sel } => self.menu_key(k, sel),
-            Modal::Stats => self.modal = Modal::None,
+            Modal::Stats => {
+                if is_close(k.code, &['g']) || k.code == KeyCode::Enter {
+                    self.modal = Modal::None;
+                }
+            }
             Modal::Victory => {
                 if matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ')) {
                     self.modal = Modal::None;
                 }
             }
+            Modal::Log { scroll } => match k.code {
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('w') => {
+                    self.modal = Modal::Log {
+                        scroll: scroll.saturating_add(1),
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('s') => {
+                    self.modal = Modal::Log {
+                        scroll: scroll.saturating_sub(1),
+                    }
+                }
+                KeyCode::PageUp => {
+                    self.modal = Modal::Log {
+                        scroll: scroll.saturating_add(10),
+                    }
+                }
+                KeyCode::PageDown => {
+                    self.modal = Modal::Log {
+                        scroll: scroll.saturating_sub(10),
+                    }
+                }
+                c if is_close(c, &['l']) => self.modal = Modal::None,
+                _ => {}
+            },
+            Modal::Confirm { action } => match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.modal = Modal::None;
+                    match action {
+                        ConfirmAction::LoadSave => {
+                            if let Err(e) = self.load_game() {
+                                self.game().log(e);
+                            }
+                        }
+                        ConfirmAction::QuitWithoutSaving => self.quit = true,
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.modal = Modal::None
+                }
+                _ => {}
+            },
         }
     }
 
@@ -265,7 +387,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') => match items[self.title_sel.min(items.len() - 1)]
             {
                 "Continue" => {
-                    if let Err(e) = self.load_game() {
+                    if let Err(e) = self.continue_game() {
                         self.title_msg = Some(e);
                     }
                 }
@@ -440,6 +562,7 @@ impl App {
                 self.modal = Modal::Research { sel };
             }
             KeyCode::Char('g') => self.modal = Modal::Stats,
+            KeyCode::Char('l') => self.modal = Modal::Log { scroll: 0 },
             KeyCode::Char('o') => self.power_overlay = !self.power_overlay,
             KeyCode::Char('p') => self.paused = !self.paused,
             KeyCode::Char('f') => self.fast = !self.fast,
@@ -448,8 +571,12 @@ impl App {
             }
             KeyCode::F(5) => self.save_game(),
             KeyCode::F(9) => {
-                if let Err(e) = self.load_game() {
-                    self.game().log(e);
+                if self.save_path.exists() {
+                    self.modal = Modal::Confirm {
+                        action: ConfirmAction::LoadSave,
+                    };
+                } else {
+                    self.game().log("No save yet: press F5 to save first.");
                 }
             }
             KeyCode::Esc => {
@@ -519,7 +646,8 @@ impl App {
             KeyCode::Char('x') => {
                 self.game().cancel_last_craft();
             }
-            _ => self.modal = Modal::None,
+            c if is_close(c, &['c', 'i']) || c == KeyCode::Tab => self.modal = Modal::None,
+            _ => {}
         }
     }
 
@@ -549,7 +677,8 @@ impl App {
                 g.player.hotbar[slot] = Some(item);
                 g.log(format!("{} assigned to hotbar slot {c}", item.name()));
             }
-            _ => self.modal = Modal::None,
+            c if is_close(c, &['b']) => self.modal = Modal::None,
+            _ => {}
         }
     }
 
@@ -572,7 +701,8 @@ impl App {
                     Err(e) => g.log(e),
                 }
             }
-            _ => self.modal = Modal::None,
+            c if is_close(c, &['t']) => self.modal = Modal::None,
+            _ => {}
         }
     }
 
@@ -631,7 +761,8 @@ impl App {
                     }
                     self.modal = Modal::None;
                 }
-                _ => self.modal = Modal::None,
+                c if is_close(c, &['e']) || c == KeyCode::Enter => self.modal = Modal::None,
+                _ => {}
             },
             EntitySub::Insert => {
                 let list = self.game().insertable(x, y);
@@ -660,7 +791,8 @@ impl App {
                             }
                         }
                     }
-                    _ => self.modal = set(EntitySub::Main, 0),
+                    c if is_close(c, &['i']) => self.modal = set(EntitySub::Main, 0),
+                    _ => {}
                 }
             }
             EntitySub::Recipe => {
@@ -680,7 +812,8 @@ impl App {
                         }
                         self.modal = set(EntitySub::Main, 0);
                     }
-                    _ => self.modal = set(EntitySub::Main, 0),
+                    c if is_close(c, &['r']) => self.modal = set(EntitySub::Main, 0),
+                    _ => {}
                 }
             }
         }
@@ -705,10 +838,14 @@ impl App {
                     self.modal = Modal::None;
                 }
                 2 => {
-                    if let Err(e) = self.load_game() {
-                        self.game().log(e);
-                    }
-                    self.modal = Modal::None;
+                    self.modal = if self.save_path.exists() {
+                        Modal::Confirm {
+                            action: ConfirmAction::LoadSave,
+                        }
+                    } else {
+                        self.game().log("No save yet: choose Save first.");
+                        Modal::None
+                    };
                 }
                 3 => self.modal = Modal::Help { scroll: 0 },
                 4 => {
@@ -717,10 +854,24 @@ impl App {
                     self.modal = Modal::None;
                     self.title_sel = 0;
                 }
-                _ => self.quit = true,
+                _ => {
+                    self.modal = Modal::Confirm {
+                        action: ConfirmAction::QuitWithoutSaving,
+                    }
+                }
             },
+            KeyCode::Char('q') => self.modal = Modal::None,
             _ => {}
         }
+    }
+}
+
+/// Esc, `q`, or one of the screen's own keys closes it; anything else is ignored.
+fn is_close(code: KeyCode, own: &[char]) -> bool {
+    match code {
+        KeyCode::Esc => true,
+        KeyCode::Char(c) => c == 'q' || own.contains(&c),
+        _ => false,
     }
 }
 
@@ -784,6 +935,46 @@ mod tests {
         }
         a.handle_key(key(KeyCode::Esc));
         assert_eq!(a.modal, Modal::Menu { sel: 0 });
+    }
+
+    #[test]
+    fn stray_keys_dont_close_screens() {
+        let mut a = app();
+        a.handle_key(key(KeyCode::Char('c')));
+        a.handle_key(key(KeyCode::Char('z')));
+        assert!(matches!(a.modal, Modal::Craft { .. }));
+        a.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(a.modal, Modal::None);
+    }
+
+    #[test]
+    fn loading_and_quitting_ask_first() {
+        let mut a = app();
+        a.save_game();
+        a.handle_key(key(KeyCode::F(9)));
+        assert!(matches!(a.modal, Modal::Confirm { .. }));
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.modal, Modal::None);
+        a.modal = Modal::Menu { sel: 5 };
+        a.handle_key(key(KeyCode::Enter));
+        assert!(!a.quit);
+        a.handle_key(key(KeyCode::Char('y')));
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn autosave_uses_its_own_file() {
+        let dir = std::env::temp_dir().join(format!("factuio-auto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = App::new(dir.join("save.json"), Some(5), false);
+        a.new_game();
+        assert!(a.autosave());
+        assert!(!a.save_path.exists());
+        assert!(a.autosave_path().exists());
+        assert_eq!(a.newest_save(), a.autosave_path());
+        a.game = None;
+        a.continue_game().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

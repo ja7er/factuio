@@ -307,7 +307,7 @@ mod tests {
             "lab status {:?}",
             g.world.entity(lab.0, lab.1).unwrap().status
         );
-        assert!(g.messages.iter().any(|m| m.contains("Fabrication")));
+        assert!(g.messages.iter().any(|m| m.text.contains("Fabrication")));
 
         // Now a fabricator can be crafted, placed and run.
         let fr = RecipeId::by_id("fabricator").unwrap();

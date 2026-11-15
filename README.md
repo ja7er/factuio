@@ -64,14 +64,17 @@ advertises it through `COLORTERM`; otherwise they fall back to the 256-colour pa
 | m | Mine the ore under the cursor by hand |
 | c / i / Tab | Crafting and inventory (`Enter` 1, `f` 5, `F` max, `x` cancel) |
 | t | Research tree |
-| g | Production statistics |
+| g | Production statistics (rates over the last minute) |
+| l | Message log |
 | o | Power coverage overlay |
 | p / f | Pause / 4× fast-forward |
-| F5 / F9 | Quick save / quick load |
+| F5 / F9 | Quick save / quick load (asks first) |
 | Esc | Menu (save, load, quit) |
 | ? | Help |
 
-The game autosaves every five minutes and on Ctrl+C.
+The game autosaves every five minutes, and when you press Ctrl+C or close the terminal,
+to a separate `save.autosave.json`, so it never overwrites a save you made yourself.
+**Continue** picks whichever is newer. Every save also keeps the previous file as `.bak`.
 
 ## How it plays
 

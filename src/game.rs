@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
 
-pub const SAVE_VERSION: u32 = 1;
+/// Bump this whenever the save format changes, and add a step to `migrate_save`.
+/// New fields should also carry `#[serde(default)]` so older saves still parse.
+pub const SAVE_VERSION: u32 = 2;
+/// Seconds an important message (research done, victory) stays highlighted.
+pub const NOTICE_SECS: u64 = 8;
 pub const HAND_MINE_TIME: f32 = 0.6;
 pub const MAP_W: i32 = 160;
 pub const MAP_H: i32 = 120;
@@ -78,10 +82,57 @@ struct SaveFile {
     player: Player,
 }
 
+/// Brings an older save up to `SAVE_VERSION`, one step at a time.
+fn migrate_save(mut v: serde_json::Value) -> Result<serde_json::Value, String> {
+    let version = v
+        .get("version")
+        .and_then(|x| x.as_u64())
+        .ok_or("Bad save file: no version")? as u32;
+    if version > SAVE_VERSION {
+        return Err(format!(
+            "This save was made by a newer factuio (save version {version}). Please update."
+        ));
+    }
+    if version == 0 {
+        return Err("Unsupported save version 0".into());
+    }
+    if version < 2 {
+        // v2 moved Uplink transmission progress from each Uplink onto the world.
+        let mut transmitted = 0;
+        if let Some(ents) = v
+            .pointer_mut("/world/entities")
+            .and_then(|e| e.as_array_mut())
+        {
+            for pair in ents {
+                if let Some(up) = pair
+                    .pointer_mut("/1/state/Uplink")
+                    .and_then(|u| u.as_object_mut())
+                    && let Some(c) = up.remove("charge")
+                {
+                    transmitted += c.as_u64().unwrap_or(0);
+                }
+            }
+        }
+        if let Some(w) = v.get_mut("world").and_then(|w| w.as_object_mut()) {
+            w.insert("transmitted".into(), transmitted.into());
+        }
+    }
+    v["version"] = SAVE_VERSION.into();
+    Ok(v)
+}
+
+#[derive(Clone, Debug)]
+pub struct LogLine {
+    pub tick: u64,
+    pub text: String,
+    /// Research results, victory: shown highlighted for a while.
+    pub important: bool,
+}
+
 pub struct Game {
     pub world: World,
     pub player: Player,
-    pub messages: Vec<String>,
+    pub messages: Vec<LogLine>,
     pub victory_pending: bool,
 }
 
@@ -89,12 +140,14 @@ impl Game {
     pub fn new(seed: u64) -> Self {
         let world = World::generate(MAP_W, MAP_H, seed);
         let spawn = world.spawn();
-        Game {
+        let mut g = Game {
             world,
             player: Player::new(spawn),
-            messages: vec!["Welcome to factuio! Press ? for help.".into()],
+            messages: vec![],
             victory_pending: false,
-        }
+        };
+        g.log("Welcome to factuio! Press ? for help.");
+        g
     }
 
     #[cfg(test)]
@@ -109,10 +162,33 @@ impl Game {
     }
 
     pub fn log(&mut self, msg: impl Into<String>) {
-        self.messages.push(msg.into());
-        if self.messages.len() > 200 {
-            self.messages.drain(0..100);
+        self.push_message(msg.into(), false);
+    }
+
+    /// Logs a message that stays highlighted for `NOTICE_SECS`.
+    pub fn notify(&mut self, msg: impl Into<String>) {
+        self.push_message(msg.into(), true);
+    }
+
+    fn push_message(&mut self, text: String, important: bool) {
+        self.messages.push(LogLine {
+            tick: self.world.tick,
+            text,
+            important,
+        });
+        if self.messages.len() > 400 {
+            self.messages.drain(0..200);
         }
+    }
+
+    /// The message to show in the status line: a recent important one wins over newer chatter.
+    pub fn status_message(&self) -> Option<&LogLine> {
+        let window = NOTICE_SECS * TICKS_PER_SEC as u64;
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.important && m.tick + window >= self.world.tick)
+            .or_else(|| self.messages.last())
     }
 
     pub fn tick(&mut self) {
@@ -121,7 +197,7 @@ impl Game {
         self.tick_crafting();
         self.tick_mining();
         for e in std::mem::take(&mut self.world.events) {
-            self.log(e);
+            self.notify(e);
         }
         if self.world.won && !was_won {
             self.victory_pending = true;
@@ -446,18 +522,21 @@ impl Game {
     }
 
     pub fn from_json(json: &str) -> Result<Game, String> {
-        let s: SaveFile = serde_json::from_str(json).map_err(|e| format!("Bad save file: {e}"))?;
-        if s.version != SAVE_VERSION {
-            return Err(format!("Unsupported save version {}", s.version));
-        }
-        Ok(Game {
+        let v: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| format!("Bad save file: {e}"))?;
+        let v = migrate_save(v)?;
+        let s: SaveFile = serde_json::from_value(v).map_err(|e| format!("Bad save file: {e}"))?;
+        let mut g = Game {
             world: World::from_save(s.world)?,
             player: s.player,
-            messages: vec!["Game loaded.".into()],
+            messages: vec![],
             victory_pending: false,
-        })
+        };
+        g.log("Game loaded.");
+        Ok(g)
     }
 
+    /// Writes the save atomically, keeping the previous file as `<name>.bak`.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -465,6 +544,9 @@ impl Game {
         let json = self.to_json()?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        if path.exists() {
+            let _ = std::fs::copy(path, path.with_extension("bak"));
+        }
         std::fs::rename(&tmp, path).map_err(|e| e.to_string())
     }
 
@@ -640,5 +722,63 @@ mod tests {
         assert_eq!(back.world.tick, g.world.tick);
         assert!(back.world.entity(x, y).is_some());
         assert!(Game::from_json("{}").is_err());
+    }
+
+    #[test]
+    fn v1_saves_still_load() {
+        let g = Game::from_json(include_str!("testdata/save_v1.json")).unwrap();
+        // The Uplink's own charge moved onto the world.
+        assert_eq!(g.world.transmitted, 2);
+        assert!(
+            g.world
+                .entities
+                .iter()
+                .flatten()
+                .any(|e| e.kind == EntityKind::Uplink)
+        );
+        // And it saves as the current version.
+        let json = g.to_json().unwrap();
+        assert!(json.contains(&format!("\"version\":{SAVE_VERSION}")));
+        assert_eq!(Game::from_json(&json).unwrap().world.transmitted, 2);
+    }
+
+    #[test]
+    fn newer_saves_are_refused_clearly() {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&Game::new(1).to_json().unwrap()).unwrap();
+        v["version"] = (SAVE_VERSION + 1).into();
+        let err = Game::from_json(&v.to_string()).err().unwrap();
+        assert!(err.contains("newer"), "{err}");
+    }
+
+    #[test]
+    fn picking_up_the_uplink_keeps_transmission_progress() {
+        let mut g = game();
+        g.player.inventory.add(Item::Uplink, 1);
+        g.place(3, 3, Item::Uplink, Dir::North).unwrap();
+        g.place(3, 5, Item::Pylon, Dir::North).unwrap();
+        g.place(4, 5, Item::Generator, Dir::North).unwrap();
+        g.insert(4, 5, Item::Lignite, 50);
+        g.player.inventory.add(Item::RelayModule, 10);
+        g.insert(3, 3, Item::RelayModule, 10);
+        run(&mut g, 31);
+        let sent = g.world.transmitted;
+        assert!(sent >= 5, "sent {sent}");
+        g.remove(3, 3).unwrap();
+        // Nothing is lost: transmitted modules stay counted, the rest come back.
+        assert_eq!(sent + g.player.inventory.count(Item::RelayModule), 10);
+        g.place(3, 3, Item::Uplink, Dir::North).unwrap();
+        assert_eq!(g.world.transmitted, sent);
+    }
+
+    #[test]
+    fn important_messages_stay_visible() {
+        let mut g = game();
+        g.notify("Research complete: Fabrication");
+        g.log("Picked up Crate");
+        assert!(g.status_message().unwrap().text.contains("Research"));
+        run(&mut g, NOTICE_SECS as u32 + 1);
+        g.log("Picked up Crate");
+        assert_eq!(g.status_message().unwrap().text, "Picked up Crate");
     }
 }

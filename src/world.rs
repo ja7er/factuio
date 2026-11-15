@@ -171,10 +171,12 @@ pub enum State {
         inv: Inventory,
         working: bool,
         progress: f32,
+        /// Datapacks consumed by the unit in progress (refunded if the lab is picked up).
+        #[serde(default)]
+        packs: Vec<Item>,
     },
     Uplink {
         inv: Inventory,
-        charge: u32,
         progress: f32,
         working: bool,
     },
@@ -229,10 +231,10 @@ impl Entity {
                 inv: Inventory::new(),
                 working: false,
                 progress: 0.0,
+                packs: vec![],
             },
             EntityKind::Uplink => State::Uplink {
                 inv: Inventory::new(),
-                charge: 0,
                 progress: 0.0,
                 working: false,
             },
@@ -295,7 +297,19 @@ impl Entity {
             State::Chest { inv: c } => merge(&mut inv, c),
             State::Generator { fuel } => add_fuel(&mut inv, fuel),
             State::Pylon | State::Solar => {}
-            State::Lab { inv: l, .. } => merge(&mut inv, l),
+            State::Lab {
+                inv: l,
+                working,
+                packs,
+                ..
+            } => {
+                merge(&mut inv, l);
+                if *working {
+                    for &p in packs {
+                        inv.add(p, 1);
+                    }
+                }
+            }
             State::Uplink {
                 inv: u, working, ..
             } => {
@@ -394,6 +408,11 @@ fn fbm(seed: u64, x: f32, y: f32) -> f32 {
     total / norm
 }
 
+/// Ticks between production snapshots used for rolling rates.
+pub const HISTORY_INTERVAL: u64 = 5 * TICKS_PER_SEC as u64;
+/// Snapshots kept (10 minutes).
+pub const HISTORY_LEN: usize = 121;
+
 pub struct World {
     pub width: i32,
     pub height: i32,
@@ -403,7 +422,11 @@ pub struct World {
     pub tick: u64,
     pub research: Research,
     pub won: bool,
+    /// Relay modules transmitted by Uplink arrays. Kept on the world so moving an Uplink keeps progress.
+    pub transmitted: u32,
     pub produced: BTreeMap<Item, u64>,
+    /// Snapshots of `produced` every `HISTORY_INTERVAL` ticks, oldest first. Not saved.
+    pub history: std::collections::VecDeque<(u64, BTreeMap<Item, u64>)>,
     pub events: Vec<String>,
     // Caches rebuilt when the layout changes.
     dirty: bool,
@@ -440,7 +463,9 @@ impl World {
             tick: 0,
             research: Research::default(),
             won: false,
+            transmitted: 0,
             produced: BTreeMap::new(),
+            history: std::collections::VecDeque::new(),
             events: vec![],
             dirty: true,
             belt_order: vec![],
@@ -795,6 +820,29 @@ impl World {
             n.demand_cur = 0.0;
         }
         self.tick += 1;
+        if self.tick.is_multiple_of(HISTORY_INTERVAL) {
+            self.history.push_back((self.tick, self.produced.clone()));
+            while self.history.len() > HISTORY_LEN {
+                self.history.pop_front();
+            }
+        }
+    }
+
+    /// Production per minute of `item` over roughly the last `window` seconds.
+    pub fn rate_per_min(&self, item: Item, window: u64) -> f32 {
+        let now = self.produced.get(&item).copied().unwrap_or(0);
+        let want = self.tick.saturating_sub(window * TICKS_PER_SEC as u64);
+        let (t0, then) = self
+            .history
+            .iter()
+            .find(|(t, _)| *t >= want)
+            .map(|(t, m)| (*t, m.get(&item).copied().unwrap_or(0)))
+            .unwrap_or((self.tick, now));
+        let dt = self.tick.saturating_sub(t0);
+        if dt == 0 {
+            return 0.0;
+        }
+        (now - then) as f32 * 60.0 * TICKS_PER_SEC as f32 / dt as f32
     }
 
     fn power_prepass(&mut self) {
@@ -1138,7 +1186,13 @@ impl World {
         };
         match phase {
             ArmPhase::Pickup => {
+                // An unpowered arm can't move, so it mustn't grab anything either.
+                let powered = self.sat_at(i) > 0.0;
+                if hand.is_none() && !powered {
+                    status = Status::NoPower;
+                }
                 if hand.is_none()
+                    && powered
                     && let (Some(b), Some(f)) = (back, front)
                     && self.entities[f].is_some()
                 {
@@ -1358,16 +1412,21 @@ impl World {
             inv,
             working,
             progress,
+            packs,
         } = &mut e.state
         else {
             return;
         };
         let t = tech.get();
         if !*working {
-            let need: Vec<(Item, u32)> = t.packs.iter().map(|&p| (p, 1)).collect();
-            if !inv.remove_all(&need, 1) {
+            if !t.packs.iter().all(|&p| inv.count(p) >= 1) {
                 e.status = Status::NoInput;
                 return;
+            }
+            packs.clear();
+            for &p in t.packs {
+                inv.remove(p, 1);
+                packs.push(p);
             }
             *working = true;
             *progress = 0.0;
@@ -1377,6 +1436,7 @@ impl World {
         if *progress >= 1.0 {
             *working = false;
             *progress = 0.0;
+            packs.clear();
             if let Some(done) = self.research.add_unit() {
                 self.events
                     .push(format!("Research complete: {}", done.get().name));
@@ -1390,14 +1450,13 @@ impl World {
         let mut status = Status::Working;
         let State::Uplink {
             inv,
-            charge,
             progress,
             working,
         } = &mut e.state
         else {
             return;
         };
-        if *charge >= UPLINK_GOAL {
+        if self.transmitted >= UPLINK_GOAL && !*working && inv.count(Item::RelayModule) == 0 {
             e.status = Status::Done;
             return;
         }
@@ -1414,8 +1473,8 @@ impl World {
         if *progress >= 1.0 {
             *working = false;
             *progress = 0.0;
-            *charge += 1;
-            if *charge >= UPLINK_GOAL && !self.won {
+            self.transmitted += 1;
+            if self.transmitted >= UPLINK_GOAL && !self.won {
                 self.won = true;
                 self.events
                     .push("The Uplink is transmitting. You win!".into());
@@ -1458,11 +1517,15 @@ impl World {
             entities,
             research: self.research.clone(),
             won: self.won,
+            transmitted: self.transmitted,
             produced: self.produced.clone(),
         }
     }
 
     pub fn from_save(s: WorldSave) -> Result<World, String> {
+        if !(1..=4096).contains(&s.width) || !(1..=4096).contains(&s.height) {
+            return Err(format!("bad map size {}x{}", s.width, s.height));
+        }
         let mut w = World::empty(s.width, s.height, s.seed);
         let n = (s.width * s.height) as usize;
         if s.terrain.chars().count() != n {
@@ -1491,6 +1554,7 @@ impl World {
         w.tick = s.tick;
         w.research = s.research;
         w.won = s.won;
+        w.transmitted = s.transmitted;
         w.produced = s.produced;
         Ok(w)
     }
@@ -1507,6 +1571,8 @@ pub struct WorldSave {
     pub entities: Vec<(u32, Entity)>,
     pub research: Research,
     pub won: bool,
+    #[serde(default)]
+    pub transmitted: u32,
     pub produced: BTreeMap<Item, u64>,
 }
 
@@ -1673,6 +1739,12 @@ mod tests {
         run(&mut w, 5);
         assert_eq!(crate_count(&w, 4, 2, Item::Cog), 0);
         assert_eq!(w.entity(3, 2).unwrap().status, Status::NoPower);
+        // An unpowered arm doesn't grab anything either.
+        assert_eq!(crate_count(&w, 2, 2, Item::Cog), 10);
+        match &w.entity(3, 2).unwrap().state {
+            State::Arm { hand, .. } => assert_eq!(*hand, None),
+            _ => unreachable!(),
+        }
         power(&mut w, 3, 4);
         run(&mut w, 5);
         assert!(crate_count(&w, 4, 2, Item::Cog) >= 4);
@@ -1752,6 +1824,34 @@ mod tests {
         run(&mut w, 40);
         assert!(w.research.is_done(fab));
         assert!(w.events.iter().any(|e| e.contains("Fabrication")));
+    }
+
+    #[test]
+    fn picking_up_a_busy_lab_refunds_its_packs() {
+        let mut w = flat(10, 10);
+        w.place(3, 3, EntityKind::Lab, Dir::North).unwrap();
+        power(&mut w, 3, 5);
+        let fab = crate::recipes::TechId::by_id("fabrication").unwrap();
+        w.research.start(fab).unwrap();
+        let i = w.idx(3, 3).unwrap();
+        w.insert(i, Item::AlphaPack, 2, true);
+        run(&mut w, 1);
+        let e = w.remove(3, 3).unwrap();
+        // One pack in progress plus one waiting: both come back.
+        assert_eq!(e.contents().count(Item::AlphaPack), 2);
+    }
+
+    #[test]
+    fn rolling_rate_tracks_recent_production() {
+        let mut w = flat(6, 6);
+        set_ore(&mut w, 2, 2, Item::Quartz, 10_000);
+        w.place(2, 2, EntityKind::Digger, Dir::East).unwrap();
+        w.place(3, 2, EntityKind::Crate, Dir::North).unwrap();
+        fuel(&mut w, 2, 2, 50);
+        run(&mut w, 70);
+        // A digger mines 0.5 ore/s = 30/min.
+        let r = w.rate_per_min(Item::Quartz, 60);
+        assert!((r - 30.0).abs() < 3.0, "rate {r}");
     }
 
     #[test]
