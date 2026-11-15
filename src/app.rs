@@ -3,6 +3,7 @@
 use crate::game::Game;
 use crate::items::{Dir, EntityKind, Item};
 use crate::recipes::{Category, RecipeId, TechId};
+use crate::records::{Placing, Records};
 use crate::settings::{KeyMap, Settings};
 use crate::tools::{Blueprint, UndoStack, UndoStep, filter_of, recipe_of, rect};
 use crate::world::State;
@@ -132,6 +133,8 @@ pub struct App {
     pub selected: Option<Item>,
     /// Recipe copied with `q` from a fabricator; new fabricators get it.
     pub selected_recipe: Option<RecipeId>,
+    /// How the win in this session placed in the speedrun records.
+    pub last_win: Option<Placing>,
     /// Filter copied with `q` from a filter arm, applied to the ones built next.
     pub selected_filter: Option<Item>,
     pub place_dir: Dir,
@@ -175,6 +178,7 @@ impl App {
             selected: None,
             selected_recipe: None,
             selected_filter: None,
+            last_win: None,
             place_dir: Dir::East,
             paint: false,
             paused: false,
@@ -204,6 +208,21 @@ impl App {
 
     pub fn settings_path(&self) -> PathBuf {
         self.base_save.with_file_name("settings.json")
+    }
+
+    pub fn records_path(&self) -> PathBuf {
+        self.base_save.with_file_name("records.json")
+    }
+
+    /// Adds a win to the speedrun records and remembers how it placed for the victory screen.
+    fn record_win(&mut self, seed: u64, ticks: u64) {
+        let path = self.records_path();
+        let mut r = Records::load(&path);
+        let placing = r.add(seed, ticks);
+        if let Err(e) = r.save(&path) {
+            self.game().log(format!("Couldn't save records: {e}"));
+        }
+        self.last_win = Some(placing);
     }
 
     pub fn apply_settings(&mut self, s: Settings) {
@@ -398,13 +417,18 @@ impl App {
         for _ in 0..n {
             g.tick();
         }
-        if g.victory_pending {
-            g.victory_pending = false;
+        let won = g
+            .victory_pending
+            .then(|| (g.world.seed, g.world.won_at.unwrap_or(g.world.tick)));
+        g.victory_pending = false;
+        let tick = g.world.tick;
+        if let Some((seed, ticks)) = won {
             self.modal = Modal::Victory;
+            self.record_win(seed, ticks);
         }
         let tps = crate::world::TICKS_PER_SEC as u64;
         let every = self.settings.autosave_minutes * 60 * tps;
-        if every > 0 && g.world.tick >= self.last_autosave_tick + every {
+        if every > 0 && tick >= self.last_autosave_tick + every {
             self.autosave();
         }
     }
@@ -633,6 +657,21 @@ impl App {
     /// Places `item`, or swaps it for a building of the same family that is already there.
     /// Records undo steps. Returns true if anything changed.
     fn build_at(&mut self, x: i32, y: i32, item: Item, dir: Dir, quiet: bool) -> bool {
+        if item == Item::Landfill {
+            let g = self.game.as_mut().unwrap();
+            return match g.landfill(x, y) {
+                Ok(()) => {
+                    self.undo.push(UndoStep::Filled { x, y });
+                    true
+                }
+                Err(e) => {
+                    if !quiet {
+                        g.log(e);
+                    }
+                    false
+                }
+            };
+        }
         let Some(kind) = item.building() else {
             return false;
         };
@@ -1336,8 +1375,8 @@ impl App {
     }
 
     fn build_key(&mut self, k: KeyEvent, sel: usize) {
-        let kinds: Vec<EntityKind> = EntityKind::menu().collect();
-        let n = kinds.len();
+        let items: Vec<Item> = Item::placeable().collect();
+        let n = items.len();
         let sel = sel.min(n - 1);
         match k.code {
             KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
@@ -1349,7 +1388,7 @@ impl App {
                 self.modal = Modal::Build { sel: (sel + 1) % n }
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                self.selected = Some(kinds[sel].item());
+                self.selected = Some(items[sel]);
                 self.selected_recipe = None;
                 self.selected_filter = None;
                 self.modal = Modal::None;
@@ -1360,7 +1399,7 @@ impl App {
                 } else {
                     c as usize - '1' as usize
                 };
-                let item = kinds[sel].item();
+                let item = items[sel];
                 let g = self.game();
                 g.player.hotbar[slot] = Some(item);
                 g.log(format!("{} assigned to hotbar slot {c}", item.name()));
@@ -1435,12 +1474,14 @@ impl App {
         }
     }
 
-    pub fn recipe_choices(&self) -> Vec<Option<RecipeId>> {
+    /// Recipes a fabricator or chem plant can be set to, after "none".
+    pub fn recipe_choices(&self, kind: EntityKind) -> Vec<Option<RecipeId>> {
         let r = &self.game.as_ref().unwrap().world.research;
+        let cat = kind.recipe_category();
         let mut v = vec![None];
         v.extend(
             RecipeId::all()
-                .filter(|&id| id.get().category == Category::Craft && r.is_unlocked(id))
+                .filter(|&id| Some(id.get().category) == cat && r.is_unlocked(id))
                 .map(Some),
         );
         v
@@ -1471,22 +1512,26 @@ impl App {
                     let now = g.world.entity(x, y).map_or(kind, |e| e.kind);
                     g.log(format!("Now a {}", now.name().to_lowercase()));
                 }
-                KeyCode::Char('f') => {
-                    let n = self.game().insert(x, y, Item::Lignite, 50);
-                    if n > 0 {
-                        self.game().log(format!("Added {n} lignite"));
-                    } else {
-                        self.game()
-                            .log("No fuel added (none in inventory, full, or no fuel slot)");
+                KeyCode::Char('f') => match self.game().add_fuel(x, y) {
+                    Some((f, n)) => {
+                        let what = f.name().to_lowercase();
+                        self.game().log(format!("Added {n} {what}"));
                     }
+                    None => self
+                        .game()
+                        .log("No fuel added (none in inventory, full, or no fuel slot)"),
+                },
+                KeyCode::Char('m') if kind.module_slots() > 0 => {
+                    let n = self.game().take_modules(x, y);
+                    self.game().log(format!("Took out {n} modules"));
                 }
-                KeyCode::Char('r') if kind == EntityKind::Fabricator => {
+                KeyCode::Char('r') if kind.recipe_category().is_some() => {
                     let cur = match &self.game().world.entity(x, y).unwrap().state {
                         State::Assembler { recipe, .. } => *recipe,
                         _ => None,
                     };
                     let pos = self
-                        .recipe_choices()
+                        .recipe_choices(kind)
                         .iter()
                         .position(|c| *c == cur)
                         .unwrap_or(0);
@@ -1536,7 +1581,7 @@ impl App {
                 }
             }
             EntitySub::Recipe => {
-                let list = self.recipe_choices();
+                let list = self.recipe_choices(kind);
                 let n = list.len();
                 match k.code {
                     KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
@@ -1982,5 +2027,64 @@ mod tests {
             State::Furnace { fuel, .. } => assert_eq!(fuel.stock, 30),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn landfill_is_placed_from_the_build_menu_and_undone() {
+        let mut a = app();
+        let g = a.game.as_mut().unwrap();
+        g.world = crate::world::World::empty(20, 20, 1);
+        let i = g.world.idx(6, 6).unwrap();
+        g.world.tiles[i].terrain = crate::world::Terrain::Water;
+        g.player.cursor = (6, 6);
+        g.player.inventory.add(Item::Landfill, 2);
+        a.handle_key(key(KeyCode::Char('b')));
+        let pos = Item::placeable().position(|i| i == Item::Landfill).unwrap();
+        a.modal = Modal::Build { sel: pos };
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.selected, Some(Item::Landfill));
+        a.handle_key(key(KeyCode::Enter));
+        let g = a.game.as_ref().unwrap();
+        assert_eq!(g.world.tiles[i].terrain, crate::world::Terrain::Sand);
+        assert_eq!(g.player.inventory.count(Item::Landfill), 1);
+        a.handle_key(key(KeyCode::Char('q')));
+        a.handle_key(key(KeyCode::Char('u')));
+        let g = a.game.as_ref().unwrap();
+        assert_eq!(g.world.tiles[i].terrain, crate::world::Terrain::Water);
+        assert_eq!(g.player.inventory.count(Item::Landfill), 2);
+    }
+
+    #[test]
+    fn chem_plants_only_list_chemistry_recipes() {
+        let mut a = app();
+        let g = a.game.as_mut().unwrap();
+        for id in ["chemistry", "energy-storage", "fabrication"] {
+            g.world.research.complete(TechId::by_id(id).unwrap());
+        }
+        let chem: Vec<_> = a
+            .recipe_choices(EntityKind::ChemPlant)
+            .into_iter()
+            .flatten()
+            .map(|r| r.get().id)
+            .collect();
+        assert_eq!(chem, vec!["resin", "battery"]);
+        assert!(
+            a.recipe_choices(EntityKind::Fabricator)
+                .into_iter()
+                .flatten()
+                .all(|r| r.get().category == Category::Craft)
+        );
+        let g = a.game.as_mut().unwrap();
+        g.player.inventory.add(Item::ChemPlant, 1);
+        g.player.inventory.add(Item::Fabricator, 1);
+        g.world = crate::world::World::empty(20, 20, 1);
+        for id in ["chemistry", "fabrication"] {
+            g.world.research.complete(TechId::by_id(id).unwrap());
+        }
+        g.place(3, 3, Item::ChemPlant, Dir::North).unwrap();
+        g.place(5, 3, Item::Fabricator, Dir::North).unwrap();
+        assert!(g.set_recipe(3, 3, RecipeId::by_id("cog")).is_err());
+        assert!(g.set_recipe(5, 3, RecipeId::by_id("resin")).is_err());
+        assert!(g.set_recipe(3, 3, RecipeId::by_id("resin")).is_ok());
     }
 }

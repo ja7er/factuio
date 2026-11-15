@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Most a battery bank charges or discharges at, in kW.
+pub const BANK_RATE: f32 = 600.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Item {
     // Raw resources
@@ -9,11 +12,13 @@ pub enum Item {
     MalachiteOre,
     Lignite,
     Quartz,
+    Water,
     // Smelted
     IronIngot,
     CopperIngot,
     Glass,
     Steel,
+    Coke,
     // Intermediates
     Cog,
     Coil,
@@ -22,10 +27,17 @@ pub enum Item {
     Motor,
     Processor,
     RelayModule,
+    Resin,
+    Battery,
+    SpeedModule,
+    ProductivityModule,
     // Research
     AlphaPack,
     BetaPack,
     GammaPack,
+    DeltaPack,
+    // Tools
+    Landfill,
     // Buildings
     Digger,
     Bore,
@@ -46,18 +58,25 @@ pub enum Item {
     Lab,
     Fabricator,
     Uplink,
+    Pump,
+    SteamTurbine,
+    Sifter,
+    ChemPlant,
+    BatteryBank,
 }
 
 impl Item {
-    pub const ALL: [Item; 37] = [
+    pub const ALL: [Item; 50] = [
         Item::FerriteOre,
         Item::MalachiteOre,
         Item::Lignite,
         Item::Quartz,
+        Item::Water,
         Item::IronIngot,
         Item::CopperIngot,
         Item::Glass,
         Item::Steel,
+        Item::Coke,
         Item::Cog,
         Item::Coil,
         Item::Chip,
@@ -65,9 +84,15 @@ impl Item {
         Item::Motor,
         Item::Processor,
         Item::RelayModule,
+        Item::Resin,
+        Item::Battery,
+        Item::SpeedModule,
+        Item::ProductivityModule,
         Item::AlphaPack,
         Item::BetaPack,
         Item::GammaPack,
+        Item::DeltaPack,
+        Item::Landfill,
         Item::Digger,
         Item::Bore,
         Item::Kiln,
@@ -87,6 +112,11 @@ impl Item {
         Item::Lab,
         Item::Fabricator,
         Item::Uplink,
+        Item::Pump,
+        Item::SteamTurbine,
+        Item::Sifter,
+        Item::ChemPlant,
+        Item::BatteryBank,
     ];
 
     pub fn name(self) -> &'static str {
@@ -95,6 +125,19 @@ impl Item {
             Item::MalachiteOre => "Malachite ore",
             Item::Lignite => "Lignite",
             Item::Quartz => "Quartz",
+            Item::Water => "Water",
+            Item::Coke => "Coke",
+            Item::Resin => "Resin",
+            Item::Battery => "Battery",
+            Item::SpeedModule => "Speed module",
+            Item::ProductivityModule => "Productivity module",
+            Item::DeltaPack => "Delta datapack",
+            Item::Landfill => "Landfill",
+            Item::Pump => "Pump",
+            Item::SteamTurbine => "Steam turbine",
+            Item::Sifter => "Sifter",
+            Item::ChemPlant => "Chem plant",
+            Item::BatteryBank => "Battery bank",
             Item::IronIngot => "Iron ingot",
             Item::CopperIngot => "Copper ingot",
             Item::Glass => "Glass",
@@ -152,6 +195,14 @@ impl Item {
             Item::AlphaPack => '1',
             Item::BetaPack => '2',
             Item::GammaPack => '3',
+            Item::DeltaPack => '4',
+            Item::Water => 'w',
+            Item::Coke => 'k',
+            Item::Resin => 'r',
+            Item::Battery => 'b',
+            Item::SpeedModule => '>',
+            Item::ProductivityModule => '$',
+            Item::Landfill => '=',
             _ => '+',
         }
     }
@@ -160,6 +211,7 @@ impl Item {
     pub fn fuel_value(self) -> Option<f32> {
         match self {
             Item::Lignite => Some(8000.0),
+            Item::Coke => Some(20000.0),
             _ => None,
         }
     }
@@ -169,7 +221,21 @@ impl Item {
     }
 
     pub fn is_pack(self) -> bool {
-        matches!(self, Item::AlphaPack | Item::BetaPack | Item::GammaPack)
+        matches!(
+            self,
+            Item::AlphaPack | Item::BetaPack | Item::GammaPack | Item::DeltaPack
+        )
+    }
+
+    pub fn is_module(self) -> bool {
+        matches!(self, Item::SpeedModule | Item::ProductivityModule)
+    }
+
+    /// Items that can be put down on the map: buildings, plus landfill.
+    pub fn placeable() -> impl Iterator<Item = Item> {
+        EntityKind::menu()
+            .map(EntityKind::item)
+            .chain(std::iter::once(Item::Landfill))
     }
 
     pub fn building(self) -> Option<EntityKind> {
@@ -201,10 +267,17 @@ pub enum EntityKind {
     Lab,
     Fabricator,
     Uplink,
+    /// Draws water from the tile behind it.
+    Pump,
+    SteamTurbine,
+    /// Sifts quartz out of the sand beneath it.
+    Sifter,
+    ChemPlant,
+    BatteryBank,
 }
 
 impl EntityKind {
-    pub const ALL: [EntityKind; 20] = [
+    pub const ALL: [EntityKind; 25] = [
         EntityKind::Digger,
         EntityKind::Bore,
         EntityKind::Kiln,
@@ -225,6 +298,11 @@ impl EntityKind {
         EntityKind::Lab,
         EntityKind::Fabricator,
         EntityKind::Uplink,
+        EntityKind::Pump,
+        EntityKind::SteamTurbine,
+        EntityKind::Sifter,
+        EntityKind::ChemPlant,
+        EntityKind::BatteryBank,
     ];
 
     pub fn item(self) -> Item {
@@ -248,6 +326,11 @@ impl EntityKind {
             EntityKind::Lab => Item::Lab,
             EntityKind::Fabricator => Item::Fabricator,
             EntityKind::Uplink => Item::Uplink,
+            EntityKind::Pump => Item::Pump,
+            EntityKind::SteamTurbine => Item::SteamTurbine,
+            EntityKind::Sifter => Item::Sifter,
+            EntityKind::ChemPlant => Item::ChemPlant,
+            EntityKind::BatteryBank => Item::BatteryBank,
         }
     }
 
@@ -289,6 +372,11 @@ impl EntityKind {
             EntityKind::Lab => "Lab",
             EntityKind::Fabricator => "Fab",
             EntityKind::Uplink => "Uplink",
+            EntityKind::Pump => "Pump",
+            EntityKind::SteamTurbine => "Turb",
+            EntityKind::Sifter => "Sift",
+            EntityKind::ChemPlant => "Chem",
+            EntityKind::BatteryBank => "Batt",
         }
     }
 
@@ -336,9 +424,36 @@ impl EntityKind {
         matches!(self, EntityKind::Digger | EntityKind::Bore)
     }
 
+    /// Buildings that work the 3x3 area beneath them and push what they get out ahead.
+    pub fn is_extractor(self) -> bool {
+        self.is_miner() || self == EntityKind::Sifter
+    }
+
+    /// Buildings that take speed and productivity modules, and how many.
+    pub fn module_slots(self) -> usize {
+        match self {
+            EntityKind::Bore
+            | EntityKind::Sifter
+            | EntityKind::ArcFurnace
+            | EntityKind::Fabricator
+            | EntityKind::ChemPlant
+            | EntityKind::Lab => 2,
+            _ => 0,
+        }
+    }
+
+    /// The recipe category an assembler of this kind runs.
+    pub fn recipe_category(self) -> Option<crate::recipes::Category> {
+        match self {
+            EntityKind::Fabricator => Some(crate::recipes::Category::Craft),
+            EntityKind::ChemPlant => Some(crate::recipes::Category::Chem),
+            _ => None,
+        }
+    }
+
     /// Whether the building has a meaningful facing direction.
     pub fn directional(self) -> bool {
-        self.is_transport() || self.is_arm() || self.is_miner()
+        self.is_transport() || self.is_arm() || self.is_extractor() || self == EntityKind::Pump
     }
 
     /// Belt movement in sub-tile units per tick.
@@ -373,6 +488,8 @@ impl EntityKind {
             EntityKind::Fabricator => 75.0,
             EntityKind::Lab => 60.0,
             EntityKind::Uplink => 600.0,
+            EntityKind::Sifter => 90.0,
+            EntityKind::ChemPlant => 120.0,
             _ => 0.0,
         }
     }
@@ -394,7 +511,9 @@ impl EntityKind {
     pub fn power_output(self) -> f32 {
         match self {
             EntityKind::Generator => 900.0,
+            EntityKind::SteamTurbine => 2400.0,
             EntityKind::SunPanel => 60.0,
+            EntityKind::BatteryBank => BANK_RATE,
             _ => 0.0,
         }
     }
@@ -412,6 +531,8 @@ impl EntityKind {
             EntityKind::ArcFurnace => 2.0,
             EntityKind::Fabricator => 1.0,
             EntityKind::Lab => 1.0,
+            EntityKind::Sifter => 1.0,
+            EntityKind::ChemPlant => 1.0,
             _ => 1.0,
         }
     }
@@ -422,8 +543,10 @@ impl EntityKind {
             EntityKind::Bore => {
                 "Electric miner for the 3x3 area beneath it. Twice the Digger's speed."
             }
-            EntityKind::Kiln => "Burns lignite to smelt ore into ingots and glass.",
-            EntityKind::ArcFurnace => "Electric smelter, twice as fast as a Kiln. No fuel needed.",
+            EntityKind::Kiln => "Burns lignite or coke to smelt ore into ingots and glass.",
+            EntityKind::ArcFurnace => {
+                "Electric smelter, twice as fast as a Kiln. No fuel needed. Bakes lignite into coke (Coking)."
+            }
             EntityKind::Conveyor => "Carries items in the direction it faces.",
             EntityKind::ExpressConveyor => "A conveyor that moves twice as fast.",
             EntityKind::Arm => {
@@ -444,12 +567,29 @@ impl EntityKind {
             }
             EntityKind::Crate => "Stores up to 800 items.",
             EntityKind::Generator => {
-                "Burns lignite to power everything on its pylon network (900 kW)."
+                "Burns lignite or coke to power everything on its pylon network (900 kW)."
+            }
+            EntityKind::Pump => {
+                "Place it with water right behind it. Pumps 2 water a second out ahead. No power needed."
+            }
+            EntityKind::SteamTurbine => {
+                "Burns lignite or coke and boils water: 2400 kW, getting 50% more from its fuel than a generator. Uses 2 water a second at full load."
+            }
+            EntityKind::Sifter => {
+                "Sifts quartz out of the sand under it (3x3, never runs out). Electric. Outputs ahead."
+            }
+            EntityKind::ChemPlant => {
+                "Electric plant for chemistry recipes: resin and batteries. Choose a recipe and feed it."
+            }
+            EntityKind::BatteryBank => {
+                "Stores 20 MJ from spare power on its network and gives it back when demand outruns supply (up to 600 kW)."
             }
             EntityKind::Pylon => {
                 "Powers machines within 2 tiles and links to pylons up to 7 tiles away."
             }
-            EntityKind::SunPanel => "Free, steady 60 kW of power.",
+            EntityKind::SunPanel => {
+                "Free power: 60 kW in full daylight, less at dawn and dusk, none at night."
+            }
             EntityKind::Lab => "Consumes datapacks to advance the current research.",
             EntityKind::Fabricator => {
                 "Electric assembler. Choose a recipe and feed it ingredients."

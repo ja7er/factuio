@@ -156,6 +156,11 @@ pub enum UndoStep {
         recipe: Option<RecipeId>,
         filter: Option<Item>,
     },
+    /// Landfill turned this water tile into sand.
+    Filled {
+        x: i32,
+        y: i32,
+    },
 }
 
 impl UndoStep {
@@ -190,6 +195,14 @@ impl UndoStep {
             } => {
                 game.world.entity(x, y).is_none()
                     && rebuild(game, (x, y), kind, dir, recipe, filter)
+            }
+            UndoStep::Filled { x, y } => {
+                if game.world.unfill(x, y) {
+                    game.player.inventory.add(Item::Landfill, 1);
+                    true
+                } else {
+                    false
+                }
             }
         }
     }
