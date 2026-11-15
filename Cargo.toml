@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "A terminal factory-automation game: mine, smelt, belt, assemble, research, and launch the Uplink."
 readme = "README.md"
+# Screenshots and the rendered soundtrack are for the README and website, not the build.
+exclude = ["docs/", "music/"]
 
 [dependencies]
 ratatui = "0.30.2"
@@ -12,6 +14,13 @@ serde_json = "1.0"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
+
+# Music output. Linux loads ALSA at run time, so there is no system library to build against.
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+cpal = "0.18"
 
 [profile.release]
 opt-level = 3

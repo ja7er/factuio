@@ -4,6 +4,7 @@ mod app;
 mod game;
 mod inventory;
 mod items;
+mod music;
 #[cfg(test)]
 mod playtest;
 mod recipes;
@@ -36,6 +37,9 @@ OPTIONS:
     --ascii           ASCII-only glyphs (for terminals without Unicode arrows)
     --256             force 256-colour mode
     --truecolor       force 24-bit colour
+    --no-music        keep the music off this session
+    --export-music <DIR>
+                      write the soundtrack to DIR as WAV files and exit
     -h, --help        show this help
 ";
 
@@ -55,6 +59,8 @@ struct Args {
     save: PathBuf,
     ascii: bool,
     color: Option<bool>,
+    no_music: bool,
+    export_music: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -66,6 +72,8 @@ fn parse_args() -> Result<Args, String> {
         save: default_save_path(),
         ascii: false,
         color: None,
+        no_music: false,
+        export_music: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -88,6 +96,12 @@ fn parse_args() -> Result<Args, String> {
             "--ascii" => a.ascii = true,
             "--256" => a.color = Some(false),
             "--truecolor" => a.color = Some(true),
+            "--no-music" => a.no_music = true,
+            "--export-music" => {
+                a.export_music = Some(PathBuf::from(
+                    it.next().ok_or("--export-music needs a folder")?,
+                ))
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -106,12 +120,19 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(dir) = &args.export_music {
+        export_music(dir);
+        return;
+    }
     ui::detect_color_support();
     if let Some(c) = args.color {
         ui::set_truecolor(c);
     }
     let mut app = App::new(args.save, args.seed, args.ascii);
     app.scenario = args.scenario;
+    if !args.no_music {
+        app.music = music::Music::live();
+    }
     let (settings, warning) = settings::Settings::load_or_create(&app.settings_path());
     let mouse = settings.mouse;
     app.apply_settings(settings);
@@ -165,6 +186,36 @@ fn main() {
                 }
             }
             std::process::exit(101);
+        }
+    }
+}
+
+fn export_music(dir: &std::path::Path) {
+    match music::export(dir) {
+        Ok(tracks) => {
+            let mut total = 0.0;
+            for t in &tracks {
+                total += t.secs;
+                println!(
+                    "{}  {:>2}:{:02}  peak {:.2}  rms {:.3}  {}",
+                    t.path.display(),
+                    t.secs as u32 / 60,
+                    t.secs as u32 % 60,
+                    t.peak,
+                    t.rms,
+                    t.title
+                );
+            }
+            println!(
+                "{} tracks, {}:{:02} in all",
+                tracks.len(),
+                total as u32 / 60,
+                total as u32 % 60
+            );
+        }
+        Err(e) => {
+            eprintln!("couldn't export the music: {e}");
+            std::process::exit(1);
         }
     }
 }
@@ -253,6 +304,7 @@ fn run(
                 next_tick = now + tick;
             }
             app.frame = app.frame.wrapping_add(1);
+            app.poll_music();
             redraw = true;
         }
     }
