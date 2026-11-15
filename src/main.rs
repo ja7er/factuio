@@ -197,6 +197,10 @@ fn run(
             break;
         }
         if redraw {
+            // Tunnel links and power networks shown on screen must be current even while paused.
+            if let Some(g) = app.game.as_mut() {
+                g.world.ensure_caches();
+            }
             terminal.draw(|f| ui::draw(f, app))?;
             redraw = false;
         }

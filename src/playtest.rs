@@ -149,7 +149,7 @@ pub fn build_demo_factory(g: &mut Game) {
         }
     }
     if let Some(e) = g.world.entity_mut(start.0, start.1)
-        && let State::Belt { items } = &mut e.state
+        && let State::Belt { items, .. } = &mut e.state
     {
         items.push(crate::world::BeltItem {
             item: Item::Lignite,

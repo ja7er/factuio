@@ -33,8 +33,12 @@ pub enum Item {
     ArcFurnace,
     Conveyor,
     ExpressConveyor,
+    Splitter,
+    Tunnel,
     Arm,
     SwiftArm,
+    LongArm,
+    FilterArm,
     Crate,
     Generator,
     Pylon,
@@ -45,8 +49,7 @@ pub enum Item {
 }
 
 impl Item {
-    #[cfg(test)]
-    pub const ALL: [Item; 33] = [
+    pub const ALL: [Item; 37] = [
         Item::FerriteOre,
         Item::MalachiteOre,
         Item::Lignite,
@@ -71,8 +74,12 @@ impl Item {
         Item::ArcFurnace,
         Item::Conveyor,
         Item::ExpressConveyor,
+        Item::Splitter,
+        Item::Tunnel,
         Item::Arm,
         Item::SwiftArm,
+        Item::LongArm,
+        Item::FilterArm,
         Item::Crate,
         Item::Generator,
         Item::Pylon,
@@ -108,8 +115,12 @@ impl Item {
             Item::ArcFurnace => "Arc furnace",
             Item::Conveyor => "Conveyor",
             Item::ExpressConveyor => "Express conveyor",
+            Item::Splitter => "Splitter",
+            Item::Tunnel => "Tunnel belt",
             Item::Arm => "Arm",
             Item::SwiftArm => "Swift arm",
+            Item::LongArm => "Long arm",
+            Item::FilterArm => "Filter arm",
             Item::Crate => "Crate",
             Item::Generator => "Generator",
             Item::Pylon => "Pylon",
@@ -174,8 +185,15 @@ pub enum EntityKind {
     ArcFurnace,
     Conveyor,
     ExpressConveyor,
+    Splitter,
+    /// Where a tunnel belt goes underground.
+    TunnelIn,
+    /// Where a tunnel belt comes back up.
+    TunnelOut,
     Arm,
     SwiftArm,
+    LongArm,
+    FilterArm,
     Crate,
     Generator,
     Pylon,
@@ -186,15 +204,20 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
-    pub const ALL: [EntityKind; 15] = [
+    pub const ALL: [EntityKind; 20] = [
         EntityKind::Digger,
         EntityKind::Bore,
         EntityKind::Kiln,
         EntityKind::ArcFurnace,
         EntityKind::Conveyor,
         EntityKind::ExpressConveyor,
+        EntityKind::Splitter,
+        EntityKind::TunnelIn,
+        EntityKind::TunnelOut,
         EntityKind::Arm,
         EntityKind::SwiftArm,
+        EntityKind::LongArm,
+        EntityKind::FilterArm,
         EntityKind::Crate,
         EntityKind::Generator,
         EntityKind::Pylon,
@@ -212,8 +235,12 @@ impl EntityKind {
             EntityKind::ArcFurnace => Item::ArcFurnace,
             EntityKind::Conveyor => Item::Conveyor,
             EntityKind::ExpressConveyor => Item::ExpressConveyor,
+            EntityKind::Splitter => Item::Splitter,
+            EntityKind::TunnelIn | EntityKind::TunnelOut => Item::Tunnel,
             EntityKind::Arm => Item::Arm,
             EntityKind::SwiftArm => Item::SwiftArm,
+            EntityKind::LongArm => Item::LongArm,
+            EntityKind::FilterArm => Item::FilterArm,
             EntityKind::Crate => Item::Crate,
             EntityKind::Generator => Item::Generator,
             EntityKind::Pylon => Item::Pylon,
@@ -225,7 +252,19 @@ impl EntityKind {
     }
 
     pub fn name(self) -> &'static str {
-        self.item().name()
+        match self {
+            EntityKind::TunnelIn => "Tunnel entrance",
+            EntityKind::TunnelOut => "Tunnel exit",
+            _ => self.item().name(),
+        }
+    }
+
+    /// The kinds a player can pick to build. A tunnel exit is placed with the same item as an
+    /// entrance, so it isn't listed on its own.
+    pub fn menu() -> impl Iterator<Item = EntityKind> {
+        EntityKind::ALL
+            .into_iter()
+            .filter(|&k| k != EntityKind::TunnelOut)
     }
 
     /// Compact name for the hotbar.
@@ -237,8 +276,12 @@ impl EntityKind {
             EntityKind::ArcFurnace => "Arc",
             EntityKind::Conveyor => "Belt",
             EntityKind::ExpressConveyor => "XBelt",
+            EntityKind::Splitter => "Split",
+            EntityKind::TunnelIn | EntityKind::TunnelOut => "Tunnel",
             EntityKind::Arm => "Arm",
             EntityKind::SwiftArm => "SArm",
+            EntityKind::LongArm => "LArm",
+            EntityKind::FilterArm => "FArm",
             EntityKind::Crate => "Crate",
             EntityKind::Generator => "Gen",
             EntityKind::Pylon => "Pylon",
@@ -253,19 +296,40 @@ impl EntityKind {
     pub fn family(self) -> Option<u8> {
         match self {
             EntityKind::Conveyor | EntityKind::ExpressConveyor => Some(0),
-            EntityKind::Arm | EntityKind::SwiftArm => Some(1),
+            EntityKind::Arm | EntityKind::SwiftArm | EntityKind::FilterArm => Some(1),
             EntityKind::Digger | EntityKind::Bore => Some(2),
             EntityKind::Kiln | EntityKind::ArcFurnace => Some(3),
             _ => None,
         }
     }
 
+    /// A plain surface conveyor.
     pub fn is_belt(self) -> bool {
         matches!(self, EntityKind::Conveyor | EntityKind::ExpressConveyor)
     }
 
+    pub fn is_tunnel(self) -> bool {
+        matches!(self, EntityKind::TunnelIn | EntityKind::TunnelOut)
+    }
+
+    /// Anything items ride on: conveyors, splitters and tunnel belts.
+    pub fn is_transport(self) -> bool {
+        self.is_belt() || self.is_tunnel() || self == EntityKind::Splitter
+    }
+
     pub fn is_arm(self) -> bool {
-        matches!(self, EntityKind::Arm | EntityKind::SwiftArm)
+        matches!(
+            self,
+            EntityKind::Arm | EntityKind::SwiftArm | EntityKind::LongArm | EntityKind::FilterArm
+        )
+    }
+
+    /// How many tiles away an arm picks up and drops.
+    pub fn arm_reach(self) -> i32 {
+        match self {
+            EntityKind::LongArm => 2,
+            _ => 1,
+        }
     }
 
     pub fn is_miner(self) -> bool {
@@ -274,13 +338,16 @@ impl EntityKind {
 
     /// Whether the building has a meaningful facing direction.
     pub fn directional(self) -> bool {
-        self.is_belt() || self.is_arm() || self.is_miner()
+        self.is_transport() || self.is_arm() || self.is_miner()
     }
 
     /// Belt movement in sub-tile units per tick.
     pub fn belt_speed(self) -> u8 {
         match self {
-            EntityKind::ExpressConveyor => 2,
+            EntityKind::ExpressConveyor
+            | EntityKind::Splitter
+            | EntityKind::TunnelIn
+            | EntityKind::TunnelOut => 2,
             _ => 1,
         }
     }
@@ -288,7 +355,8 @@ impl EntityKind {
     /// Fraction of a full swing completed per tick.
     pub fn arm_speed(self) -> f32 {
         match self {
-            EntityKind::SwiftArm => 0.25,
+            EntityKind::SwiftArm | EntityKind::FilterArm => 0.25,
+            EntityKind::LongArm => 0.125,
             _ => 0.1,
         }
     }
@@ -298,6 +366,8 @@ impl EntityKind {
         match self {
             EntityKind::Arm => 15.0,
             EntityKind::SwiftArm => 40.0,
+            EntityKind::LongArm => 25.0,
+            EntityKind::FilterArm => 45.0,
             EntityKind::Bore => 90.0,
             EntityKind::ArcFurnace => 180.0,
             EntityKind::Fabricator => 75.0,
@@ -360,6 +430,18 @@ impl EntityKind {
                 "Grabs from the tile behind and drops onto the tile ahead. Needs power."
             }
             EntityKind::SwiftArm => "A faster arm. Needs more power.",
+            EntityKind::LongArm => {
+                "Reaches two tiles: grabs from two behind and drops two ahead, over whatever is between."
+            }
+            EntityKind::FilterArm => {
+                "A swift arm that only moves the item you choose (inspect it with e, then f)."
+            }
+            EntityKind::Splitter => {
+                "Shares incoming items evenly between the conveyors ahead and to its sides."
+            }
+            EntityKind::TunnelIn | EntityKind::TunnelOut => {
+                "Carries items underground past up to 4 tiles. Place the entrance, then the exit further along."
+            }
             EntityKind::Crate => "Stores up to 800 items.",
             EntityKind::Generator => {
                 "Burns lignite to power everything on its pylon network (900 kW)."
@@ -409,6 +491,10 @@ impl Dir {
         self.cw().cw()
     }
 
+    pub fn ccw(self) -> Dir {
+        self.cw().cw().cw()
+    }
+
     pub fn arrow(self, ascii: bool) -> char {
         match (self, ascii) {
             (Dir::North, false) => '↑',
@@ -439,9 +525,13 @@ mod tests {
 
     #[test]
     fn building_items_round_trip() {
-        for k in EntityKind::ALL {
+        for k in EntityKind::menu() {
             assert_eq!(k.item().building(), Some(k));
         }
+        assert_eq!(
+            EntityKind::TunnelOut.item().building(),
+            Some(EntityKind::TunnelIn)
+        );
         assert_eq!(Item::Cog.building(), None);
     }
 
