@@ -9,6 +9,8 @@ pub enum Category {
     Craft,
     /// Made in a Kiln or Arc furnace.
     Smelt,
+    /// Made in a Chem plant.
+    Chem,
 }
 
 #[derive(Debug)]
@@ -63,6 +65,10 @@ pub static RECIPES: &[Recipe] = &[
     r!("copper-ingot", [MalachiteOre 1] => [CopperIngot 1], 3.2, Smelt, true),
     r!("glass", [Quartz 2] => [Glass 1], 3.2, Smelt, true),
     r!("steel", [IronIngot 5] => [Steel 1], 16.0, Smelt, false),
+    r!("coke", [Lignite 2] => [Coke 1], 6.4, Smelt, false),
+    // Chemistry
+    r!("resin", [Lignite 1, Water 2] => [Resin 1], 2.0, Chem, false),
+    r!("battery", [Resin 2, CopperIngot 2, Steel 1] => [Battery 1], 5.0, Chem, false),
     // Intermediates
     r!("cog", [IronIngot 2] => [Cog 1], 0.5, Craft, true),
     r!("coil", [CopperIngot 1] => [Coil 2], 0.5, Craft, true),
@@ -71,10 +77,14 @@ pub static RECIPES: &[Recipe] = &[
     r!("motor", [Steel 1, Cog 2, Coil 4] => [Motor 1], 4.0, Craft, false),
     r!("processor", [Chip 2, Lens 1, Coil 4] => [Processor 1], 6.0, Craft, false),
     r!("relay-module", [Processor 1, Motor 1, Steel 2] => [RelayModule 1], 10.0, Craft, false),
+    r!("speed-module", [Processor 1, Chip 4, Resin 2] => [SpeedModule 1], 15.0, Craft, false),
+    r!("productivity-module", [Processor 2, Lens 2, Resin 4, Battery 1] => [ProductivityModule 1], 20.0, Craft, false),
+    r!("landfill", [Quartz 8] => [Landfill 1], 1.0, Craft, false),
     // Datapacks
     r!("alpha-pack", [Cog 1, CopperIngot 1] => [AlphaPack 1], 5.0, Craft, true),
     r!("beta-pack", [Chip 1, Glass 2] => [BetaPack 1], 6.0, Craft, false),
     r!("gamma-pack", [Motor 1, Lens 1, Steel 1] => [GammaPack 2], 12.0, Craft, false),
+    r!("delta-pack", [Processor 1, Battery 1, Resin 2] => [DeltaPack 2], 16.0, Craft, false),
     // Buildings
     r!("conveyor", [IronIngot 1, Cog 1] => [Conveyor 2], 0.5, Craft, true),
     r!("express-conveyor", [Conveyor 1, Cog 2] => [ExpressConveyor 1], 1.0, Craft, false),
@@ -95,6 +105,11 @@ pub static RECIPES: &[Recipe] = &[
     r!("lab", [Chip 10, Cog 10, Conveyor 4] => [Lab 1], 2.0, Craft, true),
     r!("fabricator", [Chip 3, Cog 5, IronIngot 9] => [Fabricator 1], 0.5, Craft, false),
     r!("uplink", [Steel 50, Chip 20, Glass 20, Motor 10] => [Uplink 1], 30.0, Craft, false),
+    r!("pump", [IronIngot 5, Cog 3, Motor 1] => [Pump 1], 2.0, Craft, false),
+    r!("steam-turbine", [Steel 10, Cog 10, Motor 2, Generator 1] => [SteamTurbine 1], 5.0, Craft, false),
+    r!("sifter", [Steel 4, Cog 6, Motor 1, Chip 2] => [Sifter 1], 2.0, Craft, false),
+    r!("chem-plant", [Steel 8, Glass 10, Chip 5, Motor 2] => [ChemPlant 1], 5.0, Craft, false),
+    r!("battery-bank", [Battery 10, Steel 4, Chip 2] => [BatteryBank 1], 5.0, Craft, false),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -154,6 +169,8 @@ pub struct Tech {
     pub unit_time: f32,
     pub prereqs: &'static [&'static str],
     pub unlocks: &'static [&'static str],
+    /// Endless research: each level costs `units` more than the last and adds a bonus.
+    pub repeatable: bool,
 }
 
 pub static TECHS: &[Tech] = &[
@@ -166,6 +183,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 3.0,
         prereqs: &[],
         unlocks: &["fabricator"],
+        repeatable: false,
     },
     Tech {
         id: "logistics",
@@ -176,6 +194,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 3.0,
         prereqs: &["fabrication"],
         unlocks: &["express-conveyor", "swift-arm", "long-arm"],
+        repeatable: false,
     },
     Tech {
         id: "routing",
@@ -186,6 +205,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 3.0,
         prereqs: &["logistics"],
         unlocks: &["splitter", "tunnel"],
+        repeatable: false,
     },
     Tech {
         id: "logic",
@@ -196,6 +216,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 3.0,
         prereqs: &["fabrication"],
         unlocks: &["beta-pack"],
+        repeatable: false,
     },
     Tech {
         id: "metallurgy",
@@ -206,6 +227,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 3.0,
         prereqs: &["fabrication"],
         unlocks: &["steel"],
+        repeatable: false,
     },
     Tech {
         id: "optics",
@@ -216,6 +238,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 4.0,
         prereqs: &["logic"],
         unlocks: &["lens"],
+        repeatable: false,
     },
     Tech {
         id: "bores",
@@ -226,6 +249,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 4.0,
         prereqs: &["logic"],
         unlocks: &["bore"],
+        repeatable: false,
     },
     Tech {
         id: "sorting",
@@ -236,6 +260,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 4.0,
         prereqs: &["logistics", "logic"],
         unlocks: &["filter-arm"],
+        repeatable: false,
     },
     Tech {
         id: "motors",
@@ -246,6 +271,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 4.0,
         prereqs: &["logic", "metallurgy"],
         unlocks: &["motor"],
+        repeatable: false,
     },
     Tech {
         id: "solar",
@@ -256,6 +282,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 4.0,
         prereqs: &["optics", "metallurgy"],
         unlocks: &["sun-panel"],
+        repeatable: false,
     },
     Tech {
         id: "arc-smelting",
@@ -266,6 +293,51 @@ pub static TECHS: &[Tech] = &[
         unit_time: 4.0,
         prereqs: &["metallurgy", "logic"],
         unlocks: &["arc-furnace"],
+        repeatable: false,
+    },
+    Tech {
+        id: "landfill",
+        name: "Land reclamation",
+        desc: "Landfill: turns a water tile into sand you can build on.",
+        packs: &[AlphaPack],
+        units: 20,
+        unit_time: 3.0,
+        prereqs: &["fabrication"],
+        unlocks: &["landfill"],
+        repeatable: false,
+    },
+    Tech {
+        id: "hydraulics",
+        name: "Hydraulics",
+        desc: "Pumps that draw water, and steam turbines that turn it into lots of power.",
+        packs: &[AlphaPack, BetaPack],
+        units: 30,
+        unit_time: 4.0,
+        prereqs: &["metallurgy", "motors"],
+        unlocks: &["pump", "steam-turbine"],
+        repeatable: false,
+    },
+    Tech {
+        id: "coking",
+        name: "Coking",
+        desc: "Arc furnaces bake lignite into coke, a denser fuel (2.5x the energy).",
+        packs: &[AlphaPack, BetaPack],
+        units: 30,
+        unit_time: 4.0,
+        prereqs: &["arc-smelting"],
+        unlocks: &["coke"],
+        repeatable: false,
+    },
+    Tech {
+        id: "sifting",
+        name: "Sifting",
+        desc: "Sifters: electric machines that pull endless quartz out of sand.",
+        packs: &[AlphaPack, BetaPack],
+        units: 25,
+        unit_time: 4.0,
+        prereqs: &["bores", "motors"],
+        unlocks: &["sifter"],
+        repeatable: false,
     },
     Tech {
         id: "advanced-research",
@@ -276,6 +348,7 @@ pub static TECHS: &[Tech] = &[
         unit_time: 5.0,
         prereqs: &["motors", "optics"],
         unlocks: &["gamma-pack"],
+        repeatable: false,
     },
     Tech {
         id: "computing",
@@ -286,16 +359,95 @@ pub static TECHS: &[Tech] = &[
         unit_time: 5.0,
         prereqs: &["advanced-research"],
         unlocks: &["processor"],
+        repeatable: false,
+    },
+    Tech {
+        id: "chemistry",
+        name: "Chemistry",
+        desc: "Chem plants that make resin from lignite and water.",
+        packs: &[AlphaPack, BetaPack, GammaPack],
+        units: 50,
+        unit_time: 5.0,
+        prereqs: &["hydraulics", "advanced-research"],
+        unlocks: &["chem-plant", "resin"],
+        repeatable: false,
+    },
+    Tech {
+        id: "energy-storage",
+        name: "Energy storage",
+        desc: "Batteries, and battery banks that keep solar power for the night.",
+        packs: &[AlphaPack, BetaPack, GammaPack],
+        units: 50,
+        unit_time: 5.0,
+        prereqs: &["chemistry", "solar"],
+        unlocks: &["battery", "battery-bank"],
+        repeatable: false,
+    },
+    Tech {
+        id: "speed-modules",
+        name: "Speed modules",
+        desc: "Modules that make a machine 50% faster for 50% more power.",
+        packs: &[AlphaPack, BetaPack, GammaPack],
+        units: 60,
+        unit_time: 5.0,
+        prereqs: &["chemistry", "computing"],
+        unlocks: &["speed-module"],
+        repeatable: false,
+    },
+    Tech {
+        id: "field-theory",
+        name: "Field theory",
+        desc: "Delta datapacks, made from processors, batteries and resin.",
+        packs: &[AlphaPack, BetaPack, GammaPack],
+        units: 60,
+        unit_time: 5.0,
+        prereqs: &["energy-storage", "computing"],
+        unlocks: &["delta-pack"],
+        repeatable: false,
+    },
+    Tech {
+        id: "productivity-modules",
+        name: "Productivity modules",
+        desc: "Modules that add 10% extra output, at 15% less speed and 50% more power.",
+        packs: &[AlphaPack, BetaPack, GammaPack, DeltaPack],
+        units: 80,
+        unit_time: 6.0,
+        prereqs: &["speed-modules", "field-theory"],
+        unlocks: &["productivity-module"],
+        repeatable: false,
     },
     Tech {
         id: "uplink",
         name: "Uplink theory",
         desc: "The Uplink array and its relay modules. Transmit to win.",
-        packs: &[AlphaPack, BetaPack, GammaPack],
+        packs: &[AlphaPack, BetaPack, GammaPack, DeltaPack],
         units: 75,
         unit_time: 5.0,
-        prereqs: &["computing", "solar"],
+        prereqs: &["computing", "solar", "field-theory"],
         unlocks: &["uplink", "relay-module"],
+        repeatable: false,
+    },
+    Tech {
+        id: "mining-productivity",
+        name: "Mining productivity",
+        desc: "Endless: every level makes diggers, bores, sifters and pumps 10% faster.",
+        packs: &[AlphaPack, BetaPack, GammaPack, DeltaPack],
+        units: 50,
+        unit_time: 6.0,
+        prereqs: &["productivity-modules"],
+        unlocks: &[],
+        repeatable: true,
+    },
+    Tech {
+        id: "servo-tuning",
+        name: "Servo tuning",
+        desc: "Endless: every level makes all arms 10% faster.",
+        packs: &[AlphaPack, BetaPack, GammaPack, DeltaPack],
+        units: 40,
+        unit_time: 6.0,
+        prereqs: &["field-theory"],
+        unlocks: &[],
+        repeatable: true,
     },
 ];
 

@@ -1,7 +1,7 @@
 //! The map and the factory simulation.
 
 use crate::inventory::Inventory;
-use crate::items::{Dir, EntityKind, Item};
+use crate::items::{BANK_RATE, Dir, EntityKind, Item};
 use crate::recipes::{Category, RecipeId};
 use crate::research::Research;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,58 @@ pub const PYLON_SUPPLY: i32 = 2;
 pub const PYLON_REACH_SQ: i32 = 56;
 pub const CRATE_CAP: u32 = 800;
 pub const UPLINK_GOAL: u32 = 20;
+/// Length of a day and night, in ticks (six minutes).
+pub const DAY_TICKS: u64 = 6 * 60 * TICKS_PER_SEC as u64;
+/// Energy a battery bank holds, in kJ.
+pub const BANK_CAPACITY: f32 = 20_000.0;
+/// Water a pump delivers per second.
+pub const PUMP_RATE: f32 = 2.0;
+/// Energy a steam turbine gets from one water, in kJ (2 water/s at its full 2400 kW).
+pub const STEAM_PER_WATER: f32 = 1200.0;
+/// A steam turbine gets this much more energy out of fuel than a generator.
+pub const TURBINE_EFFICIENCY: f32 = 1.5;
+/// Seconds a sifter takes per quartz over a full 3x3 of sand.
+pub const SIFT_TIME: f32 = 4.0;
+/// Transmissions after the win that mark a milestone: each doubles the last.
+pub const MILESTONE_BASE: u32 = 40;
+
+/// Share of full sunlight at `tick`: a long day, an hour-long dusk and dawn, and a night.
+pub fn daylight_at(tick: u64) -> f32 {
+    let p = (tick % DAY_TICKS) as f32 / DAY_TICKS as f32;
+    if p < 0.55 {
+        1.0
+    } else if p < 0.65 {
+        (0.65 - p) / 0.10
+    } else if p < 0.9 {
+        0.0
+    } else {
+        (p - 0.9) / 0.10
+    }
+}
+
+/// What a machine's modules do to it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModuleEffect {
+    pub speed: f32,
+    pub power: f32,
+    /// Extra share of each output.
+    pub productivity: f32,
+}
+
+impl ModuleEffect {
+    pub fn of(modules: &[Item]) -> ModuleEffect {
+        let s = modules.iter().filter(|&&m| m == Item::SpeedModule).count() as f32;
+        let p = modules
+            .iter()
+            .filter(|&&m| m == Item::ProductivityModule)
+            .count() as f32;
+        ModuleEffect {
+            speed: (1.0 + 0.5 * s - 0.15 * p).max(0.2),
+            power: 1.0 + 0.5 * (s + p),
+            productivity: 0.1 * p,
+        }
+    }
+}
 /// Furthest a tunnel exit can be from its entrance, in tiles (so it passes under up to 4).
 pub const TUNNEL_REACH: i32 = 5;
 const NO_NET: u16 = u16::MAX;
@@ -55,7 +107,8 @@ pub enum Status {
     NoResearch,
     /// A tunnel entrance or exit without its other end.
     Unlinked,
-    Done,
+    /// A pump with no water behind it, or a steam turbine with none to boil.
+    NoWater,
 }
 
 impl Status {
@@ -72,7 +125,7 @@ impl Status {
             Status::Depleted => "no ore left",
             Status::NoResearch => "no research selected",
             Status::Unlinked => "no other end in reach",
-            Status::Done => "complete",
+            Status::NoWater => "no water",
         }
     }
 
@@ -86,6 +139,7 @@ impl Status {
                 | Status::Depleted
                 | Status::NoResearch
                 | Status::Unlinked
+                | Status::NoWater
         )
     }
 }
@@ -144,6 +198,14 @@ fn is_zero(n: &u8) -> bool {
     *n == 0
 }
 
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_f32(n: &f32) -> bool {
+    *n == 0.0
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum State {
     /// Conveyors, splitters and tunnel belts. Items are sorted by `pos`, furthest along last.
@@ -184,8 +246,18 @@ pub enum State {
     Chest {
         inv: Inventory,
     },
+    /// Generators and steam turbines. Only turbines use water.
     Generator {
         fuel: Fuel,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        water: u32,
+        /// Energy left from the water being boiled, in kJ.
+        #[serde(default, skip_serializing_if = "is_zero_f32")]
+        steam: f32,
+    },
+    Battery {
+        /// Stored energy in kJ.
+        charge: f32,
     },
     Pylon,
     Solar,
@@ -209,6 +281,12 @@ pub struct Entity {
     pub kind: EntityKind,
     pub dir: Dir,
     pub state: State,
+    /// Speed and productivity modules (machines with `module_slots`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modules: Vec<Item>,
+    /// Progress toward the next extra output from productivity modules.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub bonus: f32,
     #[serde(skip)]
     pub status: Status,
 }
@@ -233,11 +311,13 @@ impl Entity {
                 t: 0.0,
                 filter: None,
             },
-            EntityKind::Digger | EntityKind::Bore => State::Miner {
-                fuel: Fuel::default(),
-                progress: 0.0,
-                output: None,
-            },
+            EntityKind::Digger | EntityKind::Bore | EntityKind::Sifter | EntityKind::Pump => {
+                State::Miner {
+                    fuel: Fuel::default(),
+                    progress: 0.0,
+                    output: None,
+                }
+            }
             EntityKind::Kiln | EntityKind::ArcFurnace => State::Furnace {
                 fuel: Fuel::default(),
                 input: Inventory::new(),
@@ -245,7 +325,7 @@ impl Entity {
                 job: None,
                 progress: 0.0,
             },
-            EntityKind::Fabricator => State::Assembler {
+            EntityKind::Fabricator | EntityKind::ChemPlant => State::Assembler {
                 recipe: None,
                 input: Inventory::new(),
                 output: Inventory::new(),
@@ -255,9 +335,12 @@ impl Entity {
             EntityKind::Crate => State::Chest {
                 inv: Inventory::new(),
             },
-            EntityKind::Generator => State::Generator {
+            EntityKind::Generator | EntityKind::SteamTurbine => State::Generator {
                 fuel: Fuel::default(),
+                water: 0,
+                steam: 0.0,
             },
+            EntityKind::BatteryBank => State::Battery { charge: 0.0 },
             EntityKind::Pylon => State::Pylon,
             EntityKind::SunPanel => State::Solar,
             EntityKind::Lab => State::Lab {
@@ -276,6 +359,8 @@ impl Entity {
             kind,
             dir: if kind.directional() { dir } else { Dir::North },
             state,
+            modules: vec![],
+            bonus: 0.0,
             status: Status::Idle,
         }
     }
@@ -283,6 +368,9 @@ impl Entity {
     /// Everything the entity holds, including in-progress inputs, for refunds on removal.
     pub fn contents(&self) -> Inventory {
         let mut inv = Inventory::new();
+        for &m in &self.modules {
+            inv.add(m, 1);
+        }
         match &self.state {
             State::Belt { items, .. } => {
                 for b in items {
@@ -328,8 +416,13 @@ impl Entity {
                 }
             }
             State::Chest { inv: c } => merge(&mut inv, c),
-            State::Generator { fuel } => add_fuel(&mut inv, fuel),
-            State::Pylon | State::Solar => {}
+            State::Generator { fuel, water, .. } => {
+                add_fuel(&mut inv, fuel);
+                if *water > 0 {
+                    inv.add(Item::Water, *water);
+                }
+            }
+            State::Pylon | State::Solar | State::Battery { .. } => {}
             State::Lab {
                 inv: l,
                 working,
@@ -375,6 +468,11 @@ pub struct Net {
     pub demand_cur: f32,
     pub load: f32,
     pub satisfaction: f32,
+    /// Energy held in the network's battery banks and their total size, in kJ.
+    pub stored: f32,
+    pub storage: f32,
+    /// Battery flow last tick in kW: positive while charging, negative while discharging.
+    pub battery_flow: f32,
 }
 
 /// Small deterministic PRNG (SplitMix64).
@@ -457,7 +555,12 @@ pub struct World {
     pub won: bool,
     /// Relay modules transmitted by Uplink arrays. Kept on the world so moving an Uplink keeps progress.
     pub transmitted: u32,
+    /// Tick the Uplink finished its first 20 transmissions.
+    pub won_at: Option<u64>,
     pub produced: BTreeMap<Item, u64>,
+    /// Endless research bonuses, refreshed every tick: extra speed for extractors and arms.
+    mining_bonus: f32,
+    arm_bonus: f32,
     /// Snapshots of `produced` every `HISTORY_INTERVAL` ticks, oldest first. Not saved.
     pub history: std::collections::VecDeque<(u64, BTreeMap<Item, u64>)>,
     pub events: Vec<String>,
@@ -499,7 +602,10 @@ impl World {
             research: Research::default(),
             won: false,
             transmitted: 0,
+            won_at: None,
             produced: BTreeMap::new(),
+            mining_bonus: 0.0,
+            arm_bonus: 0.0,
             history: std::collections::VecDeque::new(),
             events: vec![],
             dirty: true,
@@ -636,6 +742,20 @@ impl World {
         v
     }
 
+    /// How many tiles of the 3x3 area around `i` are sand.
+    pub fn sand_in_area(&self, i: usize) -> usize {
+        self.mining_area(i)
+            .iter()
+            .filter(|&&j| self.tiles[j].terrain == Terrain::Sand)
+            .count()
+    }
+
+    /// Whether the tile behind a building at `i` facing `dir` is water.
+    pub fn water_behind(&self, i: usize, dir: Dir) -> bool {
+        self.neighbor(i, dir.opposite())
+            .is_some_and(|j| self.tiles[j].terrain == Terrain::Water)
+    }
+
     pub fn area_has_ore(&self, x: i32, y: i32) -> bool {
         self.idx(x, y).is_some_and(|i| {
             self.mining_area(i)
@@ -644,7 +764,7 @@ impl World {
         })
     }
 
-    pub fn can_place(&self, x: i32, y: i32, kind: EntityKind) -> Result<(), String> {
+    pub fn can_place(&self, x: i32, y: i32, kind: EntityKind, dir: Dir) -> Result<(), String> {
         let Some(i) = self.idx(x, y) else {
             return Err("Out of bounds".into());
         };
@@ -657,11 +777,42 @@ impl World {
         if kind.is_miner() && !self.area_has_ore(x, y) {
             return Err(format!("{} must be placed on ore", kind.name()));
         }
+        if kind == EntityKind::Sifter && self.sand_in_area(i) == 0 {
+            return Err("Sifters must be placed on sand".into());
+        }
+        if kind == EntityKind::Pump && !self.water_behind(i, dir) {
+            return Err("Pumps need water right behind them (r turns them)".into());
+        }
         Ok(())
     }
 
+    /// Turns the water tile at (x, y) into sand.
+    pub fn fill(&mut self, x: i32, y: i32) -> Result<(), String> {
+        let i = self.idx(x, y).ok_or("Out of bounds")?;
+        if self.tiles[i].terrain != Terrain::Water {
+            return Err("Landfill only goes on water".into());
+        }
+        self.tiles[i].terrain = Terrain::Sand;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Floods a landfilled tile again (for undo). Only an empty sand tile without ore.
+    pub fn unfill(&mut self, x: i32, y: i32) -> bool {
+        let Some(i) = self.idx(x, y) else {
+            return false;
+        };
+        let t = &mut self.tiles[i];
+        if t.terrain != Terrain::Sand || t.ore.is_some() || self.entities[i].is_some() {
+            return false;
+        }
+        t.terrain = Terrain::Water;
+        self.dirty = true;
+        true
+    }
+
     pub fn place(&mut self, x: i32, y: i32, kind: EntityKind, dir: Dir) -> Result<(), String> {
-        self.can_place(x, y, kind)?;
+        self.can_place(x, y, kind, dir)?;
         let i = self.idx(x, y).unwrap();
         self.entities[i] = Some(Entity::new(kind, dir));
         self.dirty = true;
@@ -986,6 +1137,7 @@ impl World {
 
     pub fn tick(&mut self) {
         self.ensure_caches();
+        self.refresh_bonuses();
         self.power_prepass();
         let belts = std::mem::take(&mut self.belt_order);
         for &i in &belts {
@@ -1010,6 +1162,40 @@ impl World {
         }
     }
 
+    fn refresh_bonuses(&mut self) {
+        let level = |id: &str| {
+            crate::recipes::TechId::by_id(id).map_or(0, |t| self.research.level(t)) as f32
+        };
+        self.mining_bonus = 1.0 + 0.1 * level("mining-productivity");
+        self.arm_bonus = 1.0 + 0.1 * level("servo-tuning");
+    }
+
+    /// Sunlight now, from 0 (night) to 1 (day).
+    pub fn daylight(&self) -> f32 {
+        daylight_at(self.tick)
+    }
+
+    /// Seconds one transmission takes at full power. After the win it gets harder with every
+    /// milestone passed.
+    pub fn transmission_secs(&self) -> f32 {
+        let mut passed = 0;
+        let mut m = MILESTONE_BASE;
+        while self.transmitted >= m {
+            passed += 1;
+            m *= 2;
+        }
+        5.0 * (1.0 + 0.5 * passed as f32)
+    }
+
+    /// Transmissions needed for the next milestone after the win.
+    pub fn next_milestone(&self) -> u32 {
+        let mut m = MILESTONE_BASE;
+        while m <= self.transmitted {
+            m *= 2;
+        }
+        m
+    }
+
     /// Production per minute of `item` over roughly the last `window` seconds.
     pub fn rate_per_min(&self, item: Item, window: u64) -> f32 {
         let now = self.produced.get(&item).copied().unwrap_or(0);
@@ -1027,41 +1213,66 @@ impl World {
         (now - then) as f32 * 60.0 * TICKS_PER_SEC as f32 / dt as f32
     }
 
+    /// Works out each network's supply for this tick from last tick's demand: sunlight first,
+    /// then generators and turbines, then battery banks. Spare supply charges the banks.
     fn power_prepass(&mut self) {
-        let mut solar = vec![0.0f32; self.nets.len()];
-        let mut gens: Vec<Vec<usize>> = vec![vec![]; self.nets.len()];
+        let nn = self.nets.len();
+        let tps = TICKS_PER_SEC as f32;
+        let light = self.daylight();
+        let mut solar = vec![0.0f32; nn];
+        let mut gen_cap = vec![0.0f32; nn];
+        let mut gens = vec![0usize; nn];
+        let mut bat_out = vec![0.0f32; nn];
+        let mut bat_in = vec![0.0f32; nn];
         for n in &mut self.nets {
-            n.capacity = 0.0;
+            n.stored = 0.0;
+            n.storage = 0.0;
         }
         for &i in &self.power_sources {
             let net = self.power_net[i];
-            let e = self.entities[i].as_ref().unwrap();
-            let fueled = match &e.state {
-                State::Generator { fuel } => fuel.has(),
-                _ => true,
-            };
             if net == NO_NET {
                 continue;
             }
             let n = net as usize;
-            if fueled {
-                self.nets[n].capacity += e.kind.power_output();
-                if e.kind == EntityKind::SunPanel {
-                    solar[n] += e.kind.power_output();
-                } else {
-                    gens[n].push(i);
+            let e = self.entities[i].as_ref().unwrap();
+            match &e.state {
+                State::Generator { fuel, water, steam } => {
+                    let wet = e.kind != EntityKind::SteamTurbine || *water > 0 || *steam > 0.0;
+                    if fuel.has() && wet {
+                        gen_cap[n] += e.kind.power_output();
+                        gens[n] += 1;
+                    }
                 }
+                State::Battery { charge } => {
+                    bat_out[n] += BANK_RATE.min(charge * tps);
+                    bat_in[n] += BANK_RATE.min((BANK_CAPACITY - charge) * tps);
+                    self.nets[n].stored += charge;
+                    self.nets[n].storage += BANK_CAPACITY;
+                }
+                _ => solar[n] += e.kind.power_output() * light,
             }
         }
-        for n in self.nets.iter_mut() {
+        // Per network: (load on each generator, battery charge rate, battery discharge rate).
+        let mut plan = vec![(0.0f32, 0.0f32, 0.0f32); nn];
+        for (k, n) in self.nets.iter_mut().enumerate() {
+            n.capacity = solar[k] + gen_cap[k] + bat_out[k];
+            let demand = n.demand_prev;
             n.satisfaction = if n.capacity <= 0.0 {
                 0.0
-            } else if n.demand_prev <= 0.0 {
+            } else if demand <= 0.0 {
                 1.0
             } else {
-                (n.capacity / n.demand_prev).min(1.0)
+                (n.capacity / demand).min(1.0)
             };
-            n.load = n.demand_prev.min(n.capacity);
+            n.load = demand.min(n.capacity);
+            let from_solar = n.load.min(solar[k]);
+            let from_gen = (n.load - from_solar).min(gen_cap[k]);
+            let discharge = (n.load - from_solar - from_gen).max(0.0);
+            let spare_solar = solar[k] - from_solar;
+            let charge = (spare_solar + gen_cap[k] - from_gen).min(bat_in[k]);
+            let gen_total = from_gen + (charge - spare_solar).max(0.0);
+            n.battery_flow = charge - discharge;
+            plan[k] = (gen_total / gens[k].max(1) as f32, charge, discharge);
         }
         for &i in &self.power_sources {
             let net = self.power_net[i];
@@ -1071,24 +1282,55 @@ impl World {
                 continue;
             }
             let n = net as usize;
-            let net_info = self.nets[n];
+            let (share, charge, discharge) = plan[n];
+            let kind = e.kind;
             match &mut e.state {
-                State::Generator { fuel } => {
+                State::Generator { fuel, water, steam } => {
                     if !fuel.has() {
                         e.status = Status::NoFuel;
                         continue;
                     }
-                    let gen_load = (net_info.load - solar[n]).max(0.0);
-                    let share = gen_load / gens[n].len().max(1) as f32;
-                    if share > 0.0 {
-                        fuel.draw(share / TICKS_PER_SEC as f32);
-                        e.status = Status::Working;
-                    } else {
-                        e.status = Status::Idle;
+                    if kind == EntityKind::SteamTurbine && *water == 0 && *steam <= 0.0 {
+                        e.status = Status::NoWater;
+                        continue;
                     }
+                    if share <= 0.0 {
+                        e.status = Status::Idle;
+                        continue;
+                    }
+                    let kj = share / tps;
+                    if kind == EntityKind::SteamTurbine {
+                        fuel.draw(kj / TURBINE_EFFICIENCY);
+                        *steam -= kj;
+                        while *steam <= 0.0 && *water > 0 {
+                            *water -= 1;
+                            *steam += STEAM_PER_WATER;
+                        }
+                        *steam = steam.max(0.0);
+                    } else {
+                        fuel.draw(kj);
+                    }
+                    e.status = Status::Working;
+                }
+                State::Battery { charge: stored } => {
+                    let out = BANK_RATE.min(*stored * tps);
+                    let room = BANK_RATE.min((BANK_CAPACITY - *stored) * tps);
+                    let mut flow = 0.0;
+                    if discharge > 0.0 && bat_out[n] > 0.0 {
+                        flow -= discharge * out / bat_out[n];
+                    }
+                    if charge > 0.0 && bat_in[n] > 0.0 {
+                        flow += charge * room / bat_in[n];
+                    }
+                    *stored = (*stored + flow / tps).clamp(0.0, BANK_CAPACITY);
+                    e.status = if flow.abs() > 0.01 {
+                        Status::Working
+                    } else {
+                        Status::Idle
+                    };
                 }
                 _ => {
-                    e.status = if net_info.load > 0.0 {
+                    e.status = if self.nets[n].load > 0.0 && light > 0.0 {
                         Status::Working
                     } else {
                         Status::Idle
@@ -1170,6 +1412,11 @@ impl World {
         let Some(e) = self.entities[i].as_ref() else {
             return 0;
         };
+        // Modules only go in by hand.
+        if item.is_module() {
+            let room = e.kind.module_slots().saturating_sub(e.modules.len()) as u32;
+            return if manual { room } else { 0 };
+        }
         let fuel_cap: u32 = if manual { 50 } else { 5 };
         let fuel_room = |f: &Fuel| {
             if item.is_fuel() && (f.item.is_none() || f.item == Some(item) || f.stock == 0) {
@@ -1186,7 +1433,7 @@ impl World {
                     0
                 }
             }
-            State::Arm { .. } | State::Pylon | State::Solar => 0,
+            State::Arm { .. } | State::Pylon | State::Solar | State::Battery { .. } => 0,
             State::Miner { fuel, .. } => {
                 if e.kind == EntityKind::Digger {
                     fuel_room(fuel)
@@ -1217,7 +1464,14 @@ impl World {
                 cap.saturating_sub(input.count(item))
             }
             State::Chest { inv } => CRATE_CAP.saturating_sub(inv.total()),
-            State::Generator { fuel } => fuel_room(fuel),
+            State::Generator { fuel, water, .. } => {
+                if item == Item::Water && e.kind == EntityKind::SteamTurbine {
+                    let cap = if manual { 200 } else { 20 };
+                    cap - (*water).min(cap)
+                } else {
+                    fuel_room(fuel)
+                }
+            }
             State::Lab { inv, .. } => {
                 if item.is_pack() {
                     let cap = if manual { 200 } else { 10 };
@@ -1255,6 +1509,11 @@ impl World {
         let Some(e) = self.entities[i].as_mut() else {
             return 0;
         };
+        if item.is_module() {
+            e.modules.extend(std::iter::repeat_n(item, cap as usize));
+            return cap;
+        }
+        let kind = e.kind;
         match &mut e.state {
             State::Belt { items, .. } => {
                 if Self::belt_insert(items, item, TILE_LEN / 2) {
@@ -1263,12 +1522,17 @@ impl World {
                     0
                 }
             }
-            State::Miner { fuel, .. } | State::Generator { fuel } => {
+            State::Generator { water, .. } if item == Item::Water => {
+                *water += cap;
+                cap
+            }
+            State::Miner { fuel, .. } | State::Generator { fuel, .. } => {
                 fuel.add(item, cap);
                 cap
             }
             State::Furnace { fuel, input, .. } => {
-                if item.is_fuel() {
+                // Only kilns burn fuel; an arc furnace bakes lignite into coke.
+                if item.is_fuel() && kind == EntityKind::Kiln {
                     fuel.add(item, cap);
                 } else {
                     input.add(item, cap);
@@ -1283,7 +1547,7 @@ impl World {
                 inv.add(item, cap);
                 cap
             }
-            State::Arm { .. } | State::Pylon | State::Solar => 0,
+            State::Arm { .. } | State::Pylon | State::Solar | State::Battery { .. } => 0,
         }
     }
 
@@ -1339,9 +1603,12 @@ impl World {
         };
         match e.kind {
             k if k.is_arm() => self.update_arm(i, &mut e),
-            EntityKind::Digger | EntityKind::Bore => self.update_miner(i, &mut e),
+            EntityKind::Digger | EntityKind::Bore | EntityKind::Sifter => {
+                self.update_miner(i, &mut e)
+            }
+            EntityKind::Pump => self.update_pump(i, &mut e),
             EntityKind::Kiln | EntityKind::ArcFurnace => self.update_furnace(i, &mut e),
-            EntityKind::Fabricator => self.update_assembler(i, &mut e),
+            EntityKind::Fabricator | EntityKind::ChemPlant => self.update_assembler(i, &mut e),
             EntityKind::Lab => self.update_lab(i, &mut e),
             EntityKind::Uplink => self.update_uplink(i, &mut e),
             EntityKind::Crate => {
@@ -1354,8 +1621,13 @@ impl World {
 
     /// Power-limited rate for an electric entity; registers its demand.
     fn electric(&mut self, i: usize, kind: EntityKind, status: &mut Status) -> f32 {
+        self.electric_kw(i, kind.power_draw(), status)
+    }
+
+    /// Like `electric`, for a draw changed by modules.
+    fn electric_kw(&mut self, i: usize, kw: f32, status: &mut Status) -> f32 {
         let sat = self.sat_at(i);
-        self.add_demand(i, kind.power_draw());
+        self.add_demand(i, kw);
         if sat <= 0.0 {
             *status = Status::NoPower;
         } else if sat < 0.999 {
@@ -1420,7 +1692,7 @@ impl World {
             }
             ArmPhase::Swing => {
                 let sat = self.electric(i, kind, &mut status);
-                *t += kind.arm_speed() * sat;
+                *t += kind.arm_speed() * self.arm_bonus * sat;
                 if *t >= 1.0 {
                     *t = 1.0;
                     let item = hand.unwrap();
@@ -1435,7 +1707,7 @@ impl World {
             }
             ArmPhase::Return => {
                 let sat = self.electric(i, kind, &mut status);
-                *t += kind.arm_speed() * sat;
+                *t += kind.arm_speed() * self.arm_bonus * sat;
                 if *t >= 1.0 {
                     *t = 0.0;
                     *phase = ArmPhase::Pickup;
@@ -1445,16 +1717,20 @@ impl World {
         e.status = status;
     }
 
+    /// Diggers and bores mining ore, and sifters working sand. Output goes to the tile ahead.
     fn update_miner(&mut self, i: usize, e: &mut Entity) {
         let front = self.neighbor(i, e.dir);
         let kind = e.kind;
-        let area = self.mining_area(i);
-        let ore_tile = area.into_iter().find(|&j| self.tiles[j].ore.is_some());
+        let fx = ModuleEffect::of(&e.modules);
         let mut status = Status::Working;
-        let mut electric_rate = None;
-        if kind == EntityKind::Bore {
-            electric_rate = Some(0.0);
-        }
+        // What to dig and how fast: a sifter's speed depends on how much sand it covers.
+        let (ore_tile, area_share, cycle) = if kind == EntityKind::Sifter {
+            (None, self.sand_in_area(i) as f32 / 9.0, SIFT_TIME)
+        } else {
+            let area = self.mining_area(i);
+            let t = area.into_iter().find(|&j| self.tiles[j].ore.is_some());
+            (t, 1.0, MINE_TIME)
+        };
         let State::Miner {
             fuel,
             progress,
@@ -1471,39 +1747,85 @@ impl World {
                 return;
             }
         }
-        let Some(ot) = ore_tile else {
+        if kind != EntityKind::Sifter && ore_tile.is_none() || area_share <= 0.0 {
             e.status = Status::Depleted;
             return;
-        };
-        let rate = if electric_rate.is_some() {
-            let sat = self.electric(i, kind, &mut status);
-            sat * kind.speed()
+        }
+        let base = if kind.uses_power() {
+            self.electric_kw(i, kind.power_draw() * fx.power, &mut status)
         } else if fuel.draw(kind.fuel_draw() / TICKS_PER_SEC as f32) {
-            kind.speed()
+            1.0
         } else {
             e.status = Status::NoFuel;
             return;
         };
-        *progress += rate / (MINE_TIME * TICKS_PER_SEC as f32);
+        let rate = base * kind.speed() * fx.speed * self.mining_bonus * area_share;
+        *progress += rate / (cycle * TICKS_PER_SEC as f32);
         if *progress >= 1.0 {
             *progress -= 1.0;
-            let tile = &mut self.tiles[ot];
-            let ore = tile.ore.unwrap();
-            tile.amount = tile.amount.saturating_sub(1);
-            if tile.amount == 0 {
-                tile.ore = None;
-            }
-            *output = Some(ore);
-            *self.produced.entry(ore).or_insert(0) += 1;
-            if front.is_some_and(|f| self.insert(f, ore, 1, false) == 1) {
+            let got = match ore_tile {
+                Some(ot) => {
+                    let tile = &mut self.tiles[ot];
+                    let ore = tile.ore.unwrap();
+                    // Productivity modules sometimes mine an ore without using any up.
+                    if e.bonus >= 1.0 {
+                        e.bonus -= 1.0;
+                    } else {
+                        tile.amount = tile.amount.saturating_sub(1);
+                        if tile.amount == 0 {
+                            tile.ore = None;
+                        }
+                        e.bonus += fx.productivity;
+                    }
+                    ore
+                }
+                None => Item::Quartz,
+            };
+            *output = Some(got);
+            *self.produced.entry(got).or_insert(0) += 1;
+            if front.is_some_and(|f| self.insert(f, got, 1, false) == 1) {
                 *output = None;
             }
         }
         e.status = status;
     }
 
+    /// Pumps push water from the tile behind them to the one ahead. They need no power.
+    fn update_pump(&mut self, i: usize, e: &mut Entity) {
+        let front = self.neighbor(i, e.dir);
+        let wet = self.water_behind(i, e.dir);
+        let State::Miner {
+            progress, output, ..
+        } = &mut e.state
+        else {
+            return;
+        };
+        if output.is_some() {
+            if front.is_some_and(|f| self.insert(f, Item::Water, 1, false) == 1) {
+                *output = None;
+            } else {
+                e.status = Status::Blocked;
+                return;
+            }
+        }
+        if !wet {
+            e.status = Status::NoWater;
+            return;
+        }
+        *progress += PUMP_RATE * self.mining_bonus / TICKS_PER_SEC as f32;
+        if *progress >= 1.0 {
+            *progress -= 1.0;
+            *self.produced.entry(Item::Water).or_insert(0) += 1;
+            if !front.is_some_and(|f| self.insert(f, Item::Water, 1, false) == 1) {
+                *output = Some(Item::Water);
+            }
+        }
+        e.status = Status::Working;
+    }
+
     fn update_furnace(&mut self, i: usize, e: &mut Entity) {
         let kind = e.kind;
+        let fx = ModuleEffect::of(&e.modules);
         let mut status = Status::Working;
         let State::Furnace {
             fuel,
@@ -1546,7 +1868,7 @@ impl World {
         }
         let rec = job.unwrap().get();
         let rate = if kind == EntityKind::ArcFurnace {
-            self.electric(i, kind, &mut status) * kind.speed()
+            self.electric_kw(i, kind.power_draw() * fx.power, &mut status) * kind.speed() * fx.speed
         } else if fuel.draw(kind.fuel_draw() / TICKS_PER_SEC as f32) {
             kind.speed()
         } else {
@@ -1555,9 +1877,10 @@ impl World {
         };
         *progress += rate / (rec.time * TICKS_PER_SEC as f32);
         if *progress >= 1.0 {
-            output.add_all(rec.outputs, 1);
+            let times = Self::with_bonus(&mut e.bonus, fx.productivity);
+            output.add_all(rec.outputs, times);
             for &(o, n) in rec.outputs {
-                *self.produced.entry(o).or_insert(0) += n as u64;
+                *self.produced.entry(o).or_insert(0) += (n * times) as u64;
             }
             *job = None;
             *progress = 0.0;
@@ -1565,8 +1888,21 @@ impl World {
         e.status = status;
     }
 
+    /// How many batches one finished craft yields: one, plus one more each time the
+    /// productivity bonus fills up.
+    fn with_bonus(bonus: &mut f32, productivity: f32) -> u32 {
+        *bonus += productivity;
+        if *bonus >= 1.0 {
+            *bonus -= 1.0;
+            2
+        } else {
+            1
+        }
+    }
+
     fn update_assembler(&mut self, i: usize, e: &mut Entity) {
         let kind = e.kind;
+        let fx = ModuleEffect::of(&e.modules);
         let mut status = Status::Working;
         let State::Assembler {
             recipe,
@@ -1596,12 +1932,15 @@ impl World {
             *working = true;
             *progress = 0.0;
         }
-        let rate = self.electric(i, kind, &mut status) * kind.speed();
+        let rate = self.electric_kw(i, kind.power_draw() * fx.power, &mut status)
+            * kind.speed()
+            * fx.speed;
         *progress += rate / (rec.time * TICKS_PER_SEC as f32);
         if *progress >= 1.0 {
-            output.add_all(rec.outputs, 1);
+            let times = Self::with_bonus(&mut e.bonus, fx.productivity);
+            output.add_all(rec.outputs, times);
             for &(o, n) in rec.outputs {
-                *self.produced.entry(o).or_insert(0) += n as u64;
+                *self.produced.entry(o).or_insert(0) += (n * times) as u64;
             }
             *working = false;
             *progress = 0.0;
@@ -1611,6 +1950,7 @@ impl World {
 
     fn update_lab(&mut self, i: usize, e: &mut Entity) {
         let kind = e.kind;
+        let fx = ModuleEffect::of(&e.modules);
         let mut status = Status::Working;
         let Some(tech) = self.research.current else {
             e.status = Status::NoResearch;
@@ -1639,18 +1979,29 @@ impl World {
             *working = true;
             *progress = 0.0;
         }
-        let rate = self.electric(i, kind, &mut status) * kind.speed();
+        let rate = self.electric_kw(i, kind.power_draw() * fx.power, &mut status)
+            * kind.speed()
+            * fx.speed;
         *progress += rate / (t.unit_time * TICKS_PER_SEC as f32);
         if *progress >= 1.0 {
             *working = false;
             *progress = 0.0;
             packs.clear();
-            if let Some(done) = self.research.add_unit() {
-                let mut msg = format!("Research complete: {}", done.get().name);
-                if let Some(next) = self.research.current {
-                    msg.push_str(&format!(". Now researching {}", next.get().name));
+            for _ in 0..Self::with_bonus(&mut e.bonus, fx.productivity) {
+                if let Some(done) = self.research.add_unit() {
+                    let level = self.research.level(done);
+                    let mut msg = if done.get().repeatable {
+                        format!("Research complete: {} {level}", done.get().name)
+                    } else {
+                        format!("Research complete: {}", done.get().name)
+                    };
+                    if let Some(next) = self.research.current
+                        && next != done
+                    {
+                        msg.push_str(&format!(". Now researching {}", next.get().name));
+                    }
+                    self.events.push(msg);
                 }
-                self.events.push(msg);
             }
         }
         e.status = status;
@@ -1667,10 +2018,6 @@ impl World {
         else {
             return;
         };
-        if self.transmitted >= UPLINK_GOAL && !*working && inv.count(Item::RelayModule) == 0 {
-            e.status = Status::Done;
-            return;
-        }
         if !*working {
             if !inv.remove(Item::RelayModule, 1) {
                 e.status = Status::NoInput;
@@ -1680,15 +2027,24 @@ impl World {
             *progress = 0.0;
         }
         let rate = self.electric(i, kind, &mut status);
-        *progress += rate / (5.0 * TICKS_PER_SEC as f32);
+        *progress += rate / (self.transmission_secs() * TICKS_PER_SEC as f32);
         if *progress >= 1.0 {
             *working = false;
             *progress = 0.0;
+            let before = self.next_milestone();
             self.transmitted += 1;
             if self.transmitted >= UPLINK_GOAL && !self.won {
                 self.won = true;
+                self.won_at = Some(self.tick);
                 self.events
                     .push("The Uplink is transmitting. You win!".into());
+            } else if self.won && self.transmitted >= before {
+                self.events.push(format!(
+                    "Milestone: {} transmissions. Each one now takes {:.1} s; next milestone at {}.",
+                    self.transmitted,
+                    self.transmission_secs(),
+                    self.next_milestone()
+                ));
             }
         }
         e.status = status;
@@ -1729,6 +2085,7 @@ impl World {
             research: self.research.clone(),
             won: self.won,
             transmitted: self.transmitted,
+            won_at: self.won_at,
             produced: self.produced.clone(),
         }
     }
@@ -1766,6 +2123,7 @@ impl World {
         w.research = s.research;
         w.won = s.won;
         w.transmitted = s.transmitted;
+        w.won_at = s.won_at;
         w.produced = s.produced;
         Ok(w)
     }
@@ -1784,6 +2142,8 @@ pub struct WorldSave {
     pub won: bool,
     #[serde(default)]
     pub transmitted: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub won_at: Option<u64>,
     pub produced: BTreeMap<Item, u64>,
 }
 
@@ -2097,6 +2457,338 @@ mod tests {
         w.insert(i, Item::RelayModule, UPLINK_GOAL, true);
         run(&mut w, 5 * UPLINK_GOAL + 5);
         assert!(w.won);
+    }
+
+    fn research(w: &mut World, id: &str) {
+        w.research
+            .complete(crate::recipes::TechId::by_id(id).unwrap());
+    }
+
+    fn set_terrain(w: &mut World, x: i32, y: i32, t: Terrain) {
+        let i = w.idx(x, y).unwrap();
+        w.tiles[i].terrain = t;
+    }
+
+    fn assembler_output(w: &World, x: i32, y: i32, item: Item) -> u32 {
+        match &w.entity(x, y).unwrap().state {
+            State::Assembler { output, .. } | State::Furnace { output, .. } => output.count(item),
+            _ => panic!("not a machine"),
+        }
+    }
+
+    fn set_recipe(w: &mut World, x: i32, y: i32, id: &str) {
+        if let State::Assembler { recipe, .. } = &mut w.entity_mut(x, y).unwrap().state {
+            *recipe = RecipeId::by_id(id);
+        }
+    }
+
+    #[test]
+    fn days_and_nights_follow_a_cycle() {
+        assert_eq!(daylight_at(0), 1.0);
+        assert_eq!(daylight_at(DAY_TICKS / 2), 1.0);
+        assert_eq!(daylight_at(DAY_TICKS * 3 / 4), 0.0);
+        assert_eq!(daylight_at(DAY_TICKS + 1), 1.0);
+        let dusk = daylight_at(DAY_TICKS * 6 / 10);
+        assert!(dusk > 0.0 && dusk < 1.0);
+        let avg: f32 = (0..DAY_TICKS).map(daylight_at).sum::<f32>() / DAY_TICKS as f32;
+        assert!((avg - 0.65).abs() < 0.01, "{avg}");
+    }
+
+    #[test]
+    fn battery_banks_store_sunlight_for_the_night() {
+        // Ten panels (600 kW at noon) run a lab (60 kW) and fill a bank by day.
+        let mut w = flat(20, 10);
+        w.place(5, 5, EntityKind::Pylon, Dir::North).unwrap();
+        for k in 0..5 {
+            w.place(3 + k, 3, EntityKind::SunPanel, Dir::North).unwrap();
+            w.place(3 + k, 7, EntityKind::SunPanel, Dir::North).unwrap();
+        }
+        w.place(4, 5, EntityKind::BatteryBank, Dir::North).unwrap();
+        w.place(6, 5, EntityKind::Fabricator, Dir::North).unwrap();
+        set_recipe(&mut w, 6, 5, "cog");
+        let fab = w.idx(6, 5).unwrap();
+        w.insert(fab, Item::IronIngot, 40, true);
+        run(&mut w, 60);
+        let charged = match w.entity(4, 5).unwrap().state {
+            State::Battery { charge } => charge,
+            _ => unreachable!(),
+        };
+        assert!(charged > 15_000.0, "{charged}");
+        let net = *w.net_at(fab).unwrap();
+        assert!(net.storage == BANK_CAPACITY && net.stored > 15_000.0);
+        // Jump to the middle of the night: the bank keeps the fabricator going.
+        w.insert(fab, Item::IronIngot, 40, true);
+        w.tick = DAY_TICKS * 3 / 4;
+        w.tick();
+        w.tick();
+        assert_eq!(w.daylight(), 0.0);
+        assert!(w.net_at(fab).unwrap().battery_flow < 0.0);
+        let before = assembler_output(&w, 6, 5, Item::Cog);
+        run(&mut w, 10);
+        assert_eq!(assembler_output(&w, 6, 5, Item::Cog), before + 20);
+        let after = match w.entity(4, 5).unwrap().state {
+            State::Battery { charge } => charge,
+            _ => unreachable!(),
+        };
+        assert!(after < charged);
+    }
+
+    #[test]
+    fn solar_alone_stops_at_night() {
+        let mut w = flat(10, 10);
+        w.place(5, 5, EntityKind::Pylon, Dir::North).unwrap();
+        w.place(4, 5, EntityKind::SunPanel, Dir::North).unwrap();
+        w.place(6, 5, EntityKind::Lab, Dir::North).unwrap();
+        w.tick = DAY_TICKS * 3 / 4;
+        run(&mut w, 1);
+        let i = w.idx(6, 5).unwrap();
+        assert_eq!(w.net_at(i).unwrap().capacity, 0.0);
+    }
+
+    #[test]
+    fn pumps_feed_steam_turbines() {
+        let mut w = flat(12, 8);
+        for y in 0..8 {
+            set_terrain(&mut w, 0, y, Terrain::Water);
+        }
+        // A pump with no water behind can't go down, and a turned one reports it.
+        assert!(w.place(3, 3, EntityKind::Pump, Dir::East).is_err());
+        w.place(1, 3, EntityKind::Pump, Dir::East).unwrap();
+        w.place(2, 3, EntityKind::SteamTurbine, Dir::North).unwrap();
+        w.place(2, 4, EntityKind::Pylon, Dir::North).unwrap();
+        w.place(3, 4, EntityKind::Fabricator, Dir::North).unwrap();
+        set_recipe(&mut w, 3, 4, "cog");
+        let t = w.idx(2, 3).unwrap();
+        let fab = w.idx(3, 4).unwrap();
+        w.insert(fab, Item::IronIngot, 40, true);
+        // Fuel but no water yet: a turbine needs both.
+        w.place(1, 6, EntityKind::Crate, Dir::North).unwrap();
+        assert_eq!(w.insert(t, Item::Coke, 10, true), 10);
+        run(&mut w, 5);
+        assert!(assembler_output(&w, 3, 4, Item::Cog) > 0);
+        assert_eq!(w.entity(2, 3).unwrap().status, Status::Working);
+        assert!(w.produced[&Item::Water] >= 9);
+        // Turn the pump away from the water: it runs dry.
+        w.rotate(1, 3);
+        run(&mut w, 1);
+        assert_eq!(w.entity(1, 3).unwrap().status, Status::NoWater);
+        // A turbine with fuel but no water says so.
+        w.place(3, 5, EntityKind::SteamTurbine, Dir::North).unwrap();
+        let dry = w.idx(3, 5).unwrap();
+        w.insert(dry, Item::Lignite, 5, true);
+        run(&mut w, 1);
+        assert_eq!(w.entity(3, 5).unwrap().status, Status::NoWater);
+        assert!(w.entity(3, 5).unwrap().status.is_problem());
+    }
+
+    #[test]
+    fn turbines_get_more_out_of_fuel_than_generators() {
+        // The same steady 75 kW load, once on a generator and once on a turbine.
+        let burn = |kind: EntityKind| {
+            let mut w = flat(10, 10);
+            w.place(5, 5, EntityKind::Pylon, Dir::North).unwrap();
+            w.place(4, 5, kind, Dir::North).unwrap();
+            w.place(6, 5, EntityKind::Fabricator, Dir::North).unwrap();
+            set_recipe(&mut w, 6, 5, "cog");
+            let g = w.idx(4, 5).unwrap();
+            let f = w.idx(6, 5).unwrap();
+            w.insert(g, Item::Lignite, 1, true);
+            w.insert(g, Item::Water, 200, true);
+            w.insert(f, Item::IronIngot, 100, true);
+            let mut ticks = 0;
+            while w.entity(4, 5).unwrap().status != Status::NoFuel && ticks < 20_000 {
+                w.insert(f, Item::IronIngot, 2, true);
+                w.take_one(f, Item::Cog);
+                w.tick();
+                ticks += 1;
+            }
+            assert!(ticks < 20_000);
+            ticks as f32
+        };
+        let generator = burn(EntityKind::Generator);
+        let turbine = burn(EntityKind::SteamTurbine);
+        let ratio = turbine / generator;
+        assert!((ratio - TURBINE_EFFICIENCY).abs() < 0.05, "{ratio}");
+    }
+
+    #[test]
+    fn sifters_sift_quartz_from_sand() {
+        let mut w = flat(10, 10);
+        assert!(w.place(3, 3, EntityKind::Sifter, Dir::East).is_err());
+        for y in 2..=4 {
+            for x in 2..=4 {
+                set_terrain(&mut w, x, y, Terrain::Sand);
+            }
+        }
+        w.place(3, 3, EntityKind::Sifter, Dir::East).unwrap();
+        w.place(4, 3, EntityKind::Crate, Dir::North).unwrap();
+        power(&mut w, 5, 5);
+        run(&mut w, 41);
+        assert_eq!(crate_count(&w, 4, 3, Item::Quartz), 10);
+    }
+
+    #[test]
+    fn landfill_turns_water_into_sand() {
+        let mut w = flat(6, 6);
+        set_terrain(&mut w, 2, 2, Terrain::Water);
+        assert!(w.can_place(2, 2, EntityKind::Crate, Dir::North).is_err());
+        assert!(w.fill(3, 3).is_err());
+        w.fill(2, 2).unwrap();
+        assert_eq!(w.tile(2, 2).unwrap().terrain, Terrain::Sand);
+        assert!(w.can_place(2, 2, EntityKind::Crate, Dir::North).is_ok());
+        assert!(w.unfill(2, 2));
+        assert_eq!(w.tile(2, 2).unwrap().terrain, Terrain::Water);
+        // Terrain changes are saved.
+        w.fill(2, 2).unwrap();
+        let back = World::from_save(w.to_save()).unwrap();
+        assert_eq!(back.tile(2, 2).unwrap().terrain, Terrain::Sand);
+    }
+
+    #[test]
+    fn arc_furnaces_bake_coke_and_kilns_burn_it() {
+        let mut w = flat(10, 10);
+        w.place(3, 3, EntityKind::ArcFurnace, Dir::North).unwrap();
+        power(&mut w, 3, 5);
+        let a = w.idx(3, 3).unwrap();
+        assert_eq!(w.insert(a, Item::Lignite, 10, true), 0);
+        research(&mut w, "coking");
+        assert_eq!(w.insert(a, Item::Lignite, 10, true), 10);
+        run(&mut w, 20);
+        assert_eq!(assembler_output(&w, 3, 3, Item::Coke), 5);
+        // A kiln takes coke as fuel and smelts with it.
+        w.place(7, 7, EntityKind::Kiln, Dir::North).unwrap();
+        let k = w.idx(7, 7).unwrap();
+        assert_eq!(w.insert(k, Item::Coke, 2, true), 2);
+        w.insert(k, Item::FerriteOre, 3, true);
+        run(&mut w, 10);
+        assert_eq!(assembler_output(&w, 7, 7, Item::IronIngot), 3);
+    }
+
+    #[test]
+    fn chem_plants_make_resin() {
+        let mut w = flat(10, 10);
+        w.place(3, 3, EntityKind::ChemPlant, Dir::North).unwrap();
+        power(&mut w, 3, 5);
+        research(&mut w, "chemistry");
+        set_recipe(&mut w, 3, 3, "resin");
+        let c = w.idx(3, 3).unwrap();
+        w.insert(c, Item::Water, 6, true);
+        w.insert(c, Item::Lignite, 3, true);
+        run(&mut w, 7);
+        assert_eq!(assembler_output(&w, 3, 3, Item::Resin), 3);
+    }
+
+    #[test]
+    fn modules_go_in_by_hand_and_change_machines() {
+        let cogs = |modules: &[Item]| {
+            let mut w = flat(10, 10);
+            w.place(3, 3, EntityKind::Fabricator, Dir::North).unwrap();
+            power(&mut w, 3, 5);
+            set_recipe(&mut w, 3, 3, "cog");
+            let f = w.idx(3, 3).unwrap();
+            for &m in modules {
+                assert_eq!(w.insert(f, m, 1, false), 0, "arms can't insert modules");
+                assert_eq!(w.insert(f, m, 1, true), 1);
+            }
+            for _ in 0..20 * TICKS_PER_SEC {
+                w.insert(f, Item::IronIngot, 2, true);
+                w.tick();
+            }
+            let n = w.idx(3, 5).unwrap();
+            (
+                assembler_output(&w, 3, 3, Item::Cog),
+                w.net_at(n).unwrap().load,
+            )
+        };
+        let (plain, kw) = cogs(&[]);
+        let (fast, fast_kw) = cogs(&[Item::SpeedModule, Item::SpeedModule]);
+        let (prod, _) = cogs(&[Item::ProductivityModule, Item::ProductivityModule]);
+        assert_eq!(plain, 40);
+        assert_eq!(fast, 80);
+        assert!((fast_kw / kw - 2.0).abs() < 0.01, "{fast_kw} vs {kw}");
+        // 30% slower, but one extra batch every five.
+        assert!((30..=34).contains(&prod), "{prod}");
+        // Only two fit, and they come back when the building is picked up.
+        let mut w = flat(6, 6);
+        w.place(2, 2, EntityKind::Lab, Dir::North).unwrap();
+        let l = w.idx(2, 2).unwrap();
+        assert_eq!(w.insert(l, Item::SpeedModule, 5, true), 2);
+        let e = w.remove(2, 2).unwrap();
+        assert_eq!(e.contents().count(Item::SpeedModule), 2);
+        // Kilns and arms have no slots.
+        w.place(3, 3, EntityKind::Kiln, Dir::North).unwrap();
+        assert_eq!(
+            w.insert(w.idx(3, 3).unwrap(), Item::SpeedModule, 1, true),
+            0
+        );
+    }
+
+    #[test]
+    fn endless_research_speeds_up_mining_and_arms() {
+        let ore_after = |level: u32| {
+            let mut w = flat(10, 10);
+            set_ore(&mut w, 3, 3, Item::FerriteOre, 1000);
+            w.place(3, 3, EntityKind::Bore, Dir::East).unwrap();
+            w.place(4, 3, EntityKind::Crate, Dir::North).unwrap();
+            power(&mut w, 3, 5);
+            let t = crate::recipes::TechId::by_id("mining-productivity").unwrap();
+            w.research.levels.insert(t, level);
+            run(&mut w, 20);
+            crate_count(&w, 4, 3, Item::FerriteOre)
+        };
+        assert_eq!(ore_after(0), 20);
+        assert!((29..=30).contains(&ore_after(5)));
+    }
+
+    #[test]
+    fn transmissions_continue_after_the_win() {
+        let mut w = flat(10, 10);
+        w.place(3, 3, EntityKind::Uplink, Dir::North).unwrap();
+        power(&mut w, 3, 5);
+        let i = w.idx(3, 3).unwrap();
+        w.insert(i, Item::RelayModule, 100, true);
+        run(&mut w, 5 * UPLINK_GOAL + 2);
+        assert!(w.won);
+        let won_at = w.won_at.unwrap();
+        assert!(won_at <= (5 * UPLINK_GOAL + 2) as u64 * TICKS_PER_SEC as u64);
+        assert_eq!(w.transmission_secs(), 5.0);
+        w.events.clear();
+        while w.transmitted < MILESTONE_BASE {
+            w.insert(i, Item::RelayModule, 1, true);
+            w.tick();
+        }
+        assert!(w.events.iter().any(|e| e.starts_with("Milestone: 40")));
+        assert_eq!(w.transmission_secs(), 7.5);
+        assert_eq!(w.next_milestone(), 80);
+        assert_eq!(w.won_at, Some(won_at));
+        let back = World::from_save(w.to_save()).unwrap();
+        assert_eq!(back.won_at, Some(won_at));
+    }
+
+    #[test]
+    fn new_buildings_survive_a_save() {
+        let mut w = flat(10, 10);
+        for y in 0..10 {
+            set_terrain(&mut w, 0, y, Terrain::Water);
+        }
+        w.place(1, 1, EntityKind::Pump, Dir::East).unwrap();
+        w.place(2, 1, EntityKind::SteamTurbine, Dir::North).unwrap();
+        w.place(2, 2, EntityKind::Pylon, Dir::North).unwrap();
+        w.place(3, 2, EntityKind::BatteryBank, Dir::North).unwrap();
+        w.place(3, 3, EntityKind::Lab, Dir::North).unwrap();
+        let t = w.idx(2, 1).unwrap();
+        let l = w.idx(3, 3).unwrap();
+        w.insert(t, Item::Lignite, 5, true);
+        w.insert(l, Item::ProductivityModule, 1, true);
+        run(&mut w, 10);
+        let json = serde_json::to_string(&w.to_save()).unwrap();
+        let back = World::from_save(serde_json::from_str(&json).unwrap()).unwrap();
+        for (a, b) in w.entities.iter().zip(&back.entities) {
+            assert_eq!(
+                a.as_ref().map(|e| (&e.state, &e.modules)),
+                b.as_ref().map(|e| (&e.state, &e.modules))
+            );
+        }
     }
 
     fn belt_items(w: &World, x: i32, y: i32) -> Vec<Item> {

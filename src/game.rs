@@ -129,6 +129,12 @@ pub struct LogLine {
     pub important: bool,
 }
 
+/// Game time as h:mm:ss.
+pub fn clock(ticks: u64) -> String {
+    let secs = ticks / TICKS_PER_SEC as u64;
+    format!("{}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+}
+
 pub struct Game {
     pub world: World,
     pub player: Player,
@@ -296,6 +302,40 @@ impl Game {
         Ok(old)
     }
 
+    /// Drops landfill from the inventory on the water tile at (x, y), making it sand.
+    pub fn landfill(&mut self, x: i32, y: i32) -> Result<(), String> {
+        if self.player.inventory.count(Item::Landfill) == 0 {
+            return Err("No Landfill in inventory".into());
+        }
+        self.world.fill(x, y)?;
+        self.player.inventory.remove(Item::Landfill, 1);
+        Ok(())
+    }
+
+    /// Takes the modules out of the building at (x, y). Returns how many.
+    pub fn take_modules(&mut self, x: i32, y: i32) -> usize {
+        let Some(e) = self.world.entity_mut(x, y) else {
+            return 0;
+        };
+        let n = e.modules.len();
+        for m in e.modules.drain(..) {
+            self.player.inventory.add(m, 1);
+        }
+        e.bonus = 0.0;
+        n
+    }
+
+    /// Adds fuel from the inventory: lignite first, then coke. Returns what went in.
+    pub fn add_fuel(&mut self, x: i32, y: i32) -> Option<(Item, u32)> {
+        for f in [Item::Lignite, Item::Coke] {
+            let n = self.insert(x, y, f, 50);
+            if n > 0 {
+                return Some((f, n));
+            }
+        }
+        None
+    }
+
     /// Sets what a filter arm moves. `None` lets it move anything.
     pub fn set_filter(&mut self, x: i32, y: i32, item: Option<Item>) -> Result<(), String> {
         let e = self.world.entity_mut(x, y).ok_or("No building here")?;
@@ -361,7 +401,7 @@ impl Game {
                 output.drain_into(&mut got);
             }
             State::Lab { inv, .. } | State::Uplink { inv, .. } => inv.drain_into(&mut got),
-            State::Generator { .. } | State::Pylon | State::Solar => {}
+            State::Generator { .. } | State::Pylon | State::Solar | State::Battery { .. } => {}
         }
         let n = got.total();
         got.drain_into(&mut self.player.inventory);
@@ -392,9 +432,13 @@ impl Game {
     }
 
     pub fn set_recipe(&mut self, x: i32, y: i32, r: Option<RecipeId>) -> Result<(), String> {
+        let kind = self.world.entity(x, y).ok_or("No building here")?.kind;
         if let Some(r) = r {
-            if r.get().category != Category::Craft {
-                return Err("Fabricators can't smelt".into());
+            match kind.recipe_category() {
+                Some(c) if c == r.get().category => {}
+                Some(Category::Chem) => return Err("Chem plants only run chemistry recipes".into()),
+                Some(_) => return Err("Fabricators can't smelt or do chemistry".into()),
+                None => return Err("Only fabricators and chem plants take a recipe".into()),
             }
             if !self.world.research.is_unlocked(r) {
                 return Err("Recipe not researched yet".into());
@@ -669,7 +713,10 @@ impl Game {
         let r = &w.research;
         let tech = |id: &str| TechId::by_id(id).is_some_and(|t| r.is_done(t));
         if w.won {
-            return "You transmitted! Keep building as long as you like.".into();
+            return format!(
+                "You won! Keep the Uplink fed for the next milestone ({}) or try endless research.",
+                w.next_milestone()
+            );
         }
         if !has(EntityKind::Digger) && !has(EntityKind::Bore) {
             return "Place a Digger (3) on ore, then fuel it: e, f.".into();
@@ -697,6 +744,10 @@ impl Game {
             if r.current.is_none() {
                 return "Pick the next research (t). The goal is Uplink theory.".into();
             }
+            if tech("chemistry") && !tech("field-theory") {
+                return "Pump water into chem plants for resin, then batteries and Delta datapacks."
+                    .into();
+            }
             return "Automate datapacks and research toward Uplink theory.".into();
         }
         if !has(EntityKind::Uplink) {
@@ -706,8 +757,7 @@ impl Game {
     }
 
     pub fn play_time(&self) -> String {
-        let secs = self.world.tick / TICKS_PER_SEC as u64;
-        format!("{}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+        clock(self.world.tick)
     }
 }
 
@@ -952,5 +1002,23 @@ mod tests {
         ));
         assert_eq!(g.player.inventory.count(Item::Coil), 0);
         assert_eq!(g.player.inventory.count(Item::FilterArm), 1);
+    }
+
+    #[test]
+    fn modules_and_coke_from_the_inventory() {
+        let mut g = game();
+        g.player.inventory = Inventory::new();
+        g.player.inventory.add(Item::Lab, 1);
+        g.player.inventory.add(Item::Kiln, 1);
+        g.player.inventory.add(Item::SpeedModule, 3);
+        g.player.inventory.add(Item::Coke, 10);
+        g.place(3, 3, Item::Lab, Dir::North).unwrap();
+        assert_eq!(g.insert(3, 3, Item::SpeedModule, 3), 2);
+        assert_eq!(g.take_modules(3, 3), 2);
+        assert_eq!(g.player.inventory.count(Item::SpeedModule), 3);
+        // With no lignite, adding fuel uses coke.
+        g.place(5, 5, Item::Kiln, Dir::North).unwrap();
+        assert_eq!(g.add_fuel(5, 5), Some((Item::Coke, 10)));
+        assert_eq!(g.add_fuel(5, 5), None);
     }
 }

@@ -126,8 +126,24 @@ malachite ─kiln─▶ copper ingot ─▶ copper coil ─▶ logic chip
 quartz ──kiln──▶ glass ─────────▶ lens (Optics)
 iron ingot ×5 ─kiln─▶ steel beam (Metallurgy) ─▶ motor (Motors)
 chip + lens + coil ─▶ processor (Computing)
+water (pump) + lignite ─chem plant─▶ resin (Chemistry) ─▶ battery (Energy storage)
+processor + battery + resin ─▶ delta datapack (Field theory)
 processor + motor + steel ─▶ relay module ─▶ Uplink array ★
 ```
+
+**Power and terrain.** Days last six minutes: sun panels give full power by day, fade at dusk and
+stop at night, so battery banks (Energy storage) earn their place. Pumps draw water from the
+tile behind them for steam turbines (2400 kW, and 50% more energy from fuel than a generator) and
+chem plants. Arc furnaces bake lignite into coke, which burns 2.5 times as long. Sifters pull
+endless quartz out of sand, and landfill turns water into buildable sand.
+
+**Modules.** Speed modules (+50% speed, +50% power) and productivity modules (a free batch every
+ten, 15% slower) go into bores, sifters, arc furnaces, fabricators, chem plants and labs by hand.
+
+**After the win.** Your winning time is saved in `~/.factuio/records.json`, with your best on that
+seed and overall shown on the victory screen. The Uplink keeps transmitting: every milestone (40,
+80, 160, …) makes each transmission take longer. Mining productivity and Servo tuning are endless
+research, each level 10% faster and pricier than the last.
 
 **Buildings.**
 
@@ -150,12 +166,17 @@ processor + motor + steel ─▶ relay module ─▶ Uplink array ★
 | `M` | Fabricator | Electric assembler for any crafting recipe (Fabrication) |
 | `L` | Lab | Consumes datapacks for the current research |
 | `U` | Uplink array | Win condition (Uplink theory) |
+| `W→` | Pump | Place with water behind; 2 water/s ahead, no power (Hydraulics) |
+| `T` | Steam turbine | Fuel + water for 2400 kW (Hydraulics) |
+| `Q→` | Sifter | Electric, endless quartz from the sand under it (Sifting) |
+| `H` | Chem plant | Electric assembler for resin and batteries (Chemistry) |
+| `A` | Battery bank | Stores 20 MJ, up to 600 kW in or out (Energy storage) |
 
 **Power.** Each pylon network sums its generators and panels. When demand exceeds
 supply every machine on that network slows down proportionally.
 
-**Research.** Fourteen technologies use Alpha, Beta and Gamma datapacks. Pick one
-with `t`, then keep your labs supplied.
+**Research.** Twenty-three technologies use Alpha, Beta, Gamma and Delta datapacks, plus two
+endless ones. Pick one with `t`, then keep your labs supplied.
 
 The sidebar always shows a **Goal** line telling you what to do next.
 

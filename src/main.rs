@@ -7,6 +7,7 @@ mod items;
 #[cfg(test)]
 mod playtest;
 mod recipes;
+mod records;
 mod research;
 mod settings;
 mod tools;

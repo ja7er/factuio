@@ -13,6 +13,9 @@ pub struct Research {
     /// Techs to research next, in order, once the current one finishes.
     #[serde(default)]
     pub queue: Vec<TechId>,
+    /// Levels finished of each endless tech.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub levels: BTreeMap<TechId, u32>,
 }
 
 impl Research {
@@ -20,8 +23,9 @@ impl Research {
         self.done.contains(&t)
     }
 
+    /// Whether `t` can be researched now. Endless techs stay available after their first level.
     pub fn is_available(&self, t: TechId) -> bool {
-        !self.is_done(t)
+        (t.get().repeatable || !self.is_done(t))
             && t.get()
                 .prereqs
                 .iter()
@@ -32,8 +36,23 @@ impl Research {
         self.progress.get(&t).copied().unwrap_or(0)
     }
 
+    /// Finished levels of an endless tech (0 for others).
+    pub fn level(&self, t: TechId) -> u32 {
+        self.levels.get(&t).copied().unwrap_or(0)
+    }
+
+    /// Units the next level of `t` takes. Each level of an endless tech costs one base amount more.
+    pub fn units_needed(&self, t: TechId) -> u32 {
+        let base = t.get().units;
+        if t.get().repeatable {
+            base * (self.level(t) + 1)
+        } else {
+            base
+        }
+    }
+
     pub fn fraction(&self, t: TechId) -> f32 {
-        self.units_done(t) as f32 / t.get().units as f32
+        self.units_done(t) as f32 / self.units_needed(t) as f32
     }
 
     pub fn is_unlocked(&self, r: RecipeId) -> bool {
@@ -42,7 +61,7 @@ impl Research {
     }
 
     pub fn start(&mut self, t: TechId) -> Result<(), String> {
-        if self.is_done(t) {
+        if self.is_done(t) && !t.get().repeatable {
             return Err(format!("{} is already researched", t.get().name));
         }
         if !self.is_available(t) {
@@ -62,19 +81,33 @@ impl Research {
     /// A finished tech hands over to the first queued tech that is now available.
     pub fn add_unit(&mut self) -> Option<TechId> {
         let t = self.current?;
+        let need = self.units_needed(t);
         let n = self.progress.entry(t).or_insert(0);
         *n += 1;
-        if *n >= t.get().units {
+        if *n >= need {
             self.done.insert(t);
-            self.current = None;
-            self.start_next_queued();
+            if t.get().repeatable {
+                // On to the next level, unless something else is waiting in the queue.
+                *self.levels.entry(t).or_insert(0) += 1;
+                self.progress.insert(t, 0);
+                self.start_next_queued();
+                if self.current.is_none() {
+                    self.current = Some(t);
+                }
+            } else {
+                self.current = None;
+                self.start_next_queued();
+            }
             return Some(t);
         }
         None
     }
 
     fn start_next_queued(&mut self) {
-        self.queue.retain(|q| !self.done.contains(q));
+        let done = &self.done;
+        self.queue
+            .retain(|q| q.get().repeatable || !done.contains(q));
+        self.current = None;
         if let Some(k) = self.queue.iter().position(|&q| self.is_available(q)) {
             self.current = Some(self.queue.remove(k));
         }
@@ -83,7 +116,7 @@ impl Research {
     /// Queues `t` along with any prerequisites it still needs, in a workable order.
     /// Starts right away if nothing is being researched. Returns how many techs were added.
     pub fn enqueue(&mut self, t: TechId) -> Result<usize, String> {
-        if self.is_done(t) {
+        if self.is_done(t) && !t.get().repeatable {
             return Err(format!("{} is already researched", t.get().name));
         }
         let mut order = vec![];
@@ -105,7 +138,10 @@ impl Research {
     }
 
     fn collect_missing(&self, t: TechId, out: &mut Vec<TechId>) {
-        if self.is_done(t) || out.contains(&t) {
+        if out.contains(&t) {
+            return;
+        }
+        if self.is_done(t) && !(t.get().repeatable && out.is_empty()) {
             return;
         }
         for p in t.get().prereqs {
@@ -131,8 +167,12 @@ impl Research {
         }
     }
 
+    /// Every tech except the endless ones is researched.
     pub fn all_done(&self) -> bool {
-        self.done.len() == TECHS.len()
+        TECHS
+            .iter()
+            .enumerate()
+            .all(|(i, t)| t.repeatable || self.done.contains(&TechId(i as u16)))
     }
 }
 
@@ -174,5 +214,39 @@ mod tests {
         assert_eq!(finished, vec!["fabrication", "logic", "optics"]);
         assert!(r.queue.is_empty());
         assert!(r.enqueue(optics).is_err());
+    }
+
+    #[test]
+    fn endless_research_keeps_going_and_gets_dearer() {
+        let mut r = Research::default();
+        let servo = TechId::by_id("servo-tuning").unwrap();
+        for t in TechId::all() {
+            if t != servo && !t.get().repeatable {
+                r.complete(t);
+            }
+        }
+        assert!(r.all_done());
+        r.start(servo).unwrap();
+        let base = servo.get().units;
+        let mut levels = vec![];
+        for _ in 0..base * 6 {
+            if r.add_unit().is_some() {
+                levels.push(r.level(servo));
+            }
+        }
+        // 1 + 2 + 3 bases of units for three levels.
+        assert_eq!(levels, vec![1, 2, 3]);
+        assert_eq!(r.current, Some(servo));
+        assert_eq!(r.units_needed(servo), base * 4);
+        assert!(r.is_available(servo));
+        // Something queued takes over when a level finishes, and the endless tech can be queued again.
+        let mining = TechId::by_id("mining-productivity").unwrap();
+        r.enqueue(mining).unwrap();
+        while r.current == Some(servo) {
+            r.add_unit();
+        }
+        assert_eq!(r.current, Some(mining));
+        assert_eq!(r.level(servo), 4);
+        assert_eq!(r.enqueue(servo).unwrap(), 1);
     }
 }
