@@ -1,13 +1,21 @@
-//! Application state and keyboard handling.
+//! Application state, keyboard and mouse handling.
 
 use crate::game::Game;
 use crate::items::{Dir, EntityKind, Item};
 use crate::recipes::{Category, RecipeId, TechId};
+use crate::settings::{KeyMap, Settings};
+use crate::tools::{Blueprint, UndoStack, UndoStep, recipe_of, rect};
 use crate::world::State;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::layout::Rect;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
-pub const AUTOSAVE_SECS: u64 = 300;
+/// Numbered save slots (slot 1 is the `--save` file).
+pub const SAVE_SLOTS: usize = 5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntitySub {
@@ -50,18 +58,29 @@ pub enum Modal {
     Confirm {
         action: ConfirmAction,
     },
+    /// The whole map at a glance.
+    Minimap,
+    /// Pick a save slot to save to or load from.
+    Slots {
+        save: bool,
+        sel: usize,
+    },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ConfirmAction {
-    LoadSave,
+    LoadFrom(PathBuf),
+    SaveOver(PathBuf),
     QuitWithoutSaving,
 }
 
 impl ConfirmAction {
-    pub fn question(self) -> &'static str {
+    pub fn question(&self) -> &'static str {
         match self {
-            ConfirmAction::LoadSave => "Load the last save? Progress since then will be lost.",
+            ConfirmAction::LoadFrom(_) => {
+                "Load this save? Progress since your last save will be lost."
+            }
+            ConfirmAction::SaveOver(_) => "Save over this slot? The game in it will be replaced.",
             ConfirmAction::QuitWithoutSaving => {
                 "Quit without saving? Progress since the last save will be lost."
             }
@@ -71,29 +90,78 @@ impl ConfirmAction {
 
 pub const MENU_ITEMS: [&str; 6] = [
     "Resume",
-    "Save",
-    "Load",
+    "Save to slot…",
+    "Load slot…",
     "Help",
     "Save & quit to title",
     "Quit without saving",
 ];
 
+/// A save slot as shown in the slot picker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotInfo {
+    pub label: String,
+    pub path: PathBuf,
+    pub exists: bool,
+    /// "0:42:10 played · 5 min ago", or why it can't be read.
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Drag {
+    /// Left button with a building selected: lay buildings along the path.
+    Paint,
+    /// Left button on empty ground: select an area.
+    Area,
+    /// Right button: pick up along the path.
+    Remove,
+}
+
+/// Where the minimap was drawn: its area and how many tiles one cell covers (x, and y per half-cell).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct MinimapGeom {
+    pub area: Rect,
+    pub sx: i32,
+    pub sy: i32,
+}
+
 pub struct App {
     pub game: Option<Game>,
     pub modal: Modal,
     pub selected: Option<Item>,
+    /// Recipe copied with `q` from a fabricator; new fabricators get it.
+    pub selected_recipe: Option<RecipeId>,
     pub place_dir: Dir,
     pub paint: bool,
     pub paused: bool,
     pub fast: bool,
     pub ascii: bool,
     pub power_overlay: bool,
+    /// The slot F5 and F9 use: the one last saved to or loaded from.
     pub save_path: PathBuf,
+    /// The `--save` path: slot 1, and where the other slots, the autosave and settings live.
+    pub base_save: PathBuf,
     pub seed: Option<u64>,
     pub quit: bool,
     pub title_sel: usize,
     pub title_msg: Option<String>,
     pub last_autosave_tick: u64,
+    pub settings: Settings,
+    pub keymap: KeyMap,
+    /// First corner of an area selection (the cursor is the other).
+    pub area_anchor: Option<(i32, i32)>,
+    /// A copied layout, placed with Enter.
+    pub blueprint: Option<Blueprint>,
+    pub undo: UndoStack,
+    pub slots: Vec<SlotInfo>,
+    /// Top-left tile of the map view. Kept between frames so the view only scrolls near its edges.
+    pub camera: Cell<Option<(i32, i32)>>,
+    /// Where the map was last drawn, for mouse clicks.
+    pub map_rect: Cell<Rect>,
+    /// Hotbar slot areas from the last frame.
+    pub hotbar_hits: RefCell<Vec<(Rect, usize)>>,
+    pub minimap_geom: Cell<MinimapGeom>,
+    drag: Option<Drag>,
 }
 
 impl App {
@@ -102,46 +170,106 @@ impl App {
             game: None,
             modal: Modal::None,
             selected: None,
+            selected_recipe: None,
             place_dir: Dir::East,
             paint: false,
             paused: false,
             fast: false,
             ascii,
             power_overlay: false,
+            base_save: save_path.clone(),
             save_path,
             seed,
             quit: false,
             title_sel: 0,
             title_msg: None,
             last_autosave_tick: 0,
+            settings: Settings::default(),
+            keymap: KeyMap::default(),
+            area_anchor: None,
+            blueprint: None,
+            undo: UndoStack::default(),
+            slots: vec![],
+            camera: Cell::new(None),
+            map_rect: Cell::new(Rect::default()),
+            hotbar_hits: RefCell::new(vec![]),
+            minimap_geom: Cell::new(MinimapGeom::default()),
+            drag: None,
         }
+    }
+
+    pub fn settings_path(&self) -> PathBuf {
+        self.base_save.with_file_name("settings.json")
+    }
+
+    pub fn apply_settings(&mut self, s: Settings) {
+        let (map, problems) = s.key_map();
+        self.keymap = map;
+        self.ascii |= s.ascii;
+        if !problems.is_empty() {
+            self.title_msg = Some(format!("settings.json: {}", problems.join("; ")));
+        }
+        self.settings = s;
+    }
+
+    fn base_stem(&self) -> String {
+        self.base_save
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "save".into())
     }
 
     /// Where autosaves (and emergency saves on Ctrl+C or a closed terminal) go,
     /// so they never overwrite a save the player made on purpose.
     pub fn autosave_path(&self) -> PathBuf {
-        let stem = self
-            .save_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "save".into());
-        self.save_path
-            .with_file_name(format!("{stem}.autosave.json"))
+        self.base_save
+            .with_file_name(format!("{}.autosave.json", self.base_stem()))
+    }
+
+    /// The numbered slots, slot 1 first.
+    pub fn slot_paths(&self) -> Vec<(String, PathBuf)> {
+        let stem = self.base_stem();
+        let mut v = vec![("Slot 1".to_string(), self.base_save.clone())];
+        for n in 2..=SAVE_SLOTS {
+            v.push((
+                format!("Slot {n}"),
+                self.base_save.with_file_name(format!("{stem}-{n}.json")),
+            ));
+        }
+        v
+    }
+
+    fn all_save_paths(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self.slot_paths().into_iter().map(|(_, p)| p).collect();
+        v.push(self.autosave_path());
+        v
     }
 
     pub fn save_exists(&self) -> bool {
-        self.save_path.exists() || self.autosave_path().exists()
+        self.all_save_paths().iter().any(|p| p.exists())
     }
 
-    /// The most recently written of the main save and the autosave.
+    /// The most recently written save of any slot, including the autosave.
     pub fn newest_save(&self) -> PathBuf {
         let mtime = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        let auto = self.autosave_path();
-        match (mtime(&self.save_path), mtime(&auto)) {
-            (Some(a), Some(b)) if b > a => auto,
-            (None, Some(_)) => auto,
-            _ => self.save_path.clone(),
+        self.all_save_paths()
+            .into_iter()
+            .filter_map(|p| mtime(&p).map(|t| (t, p)))
+            .max_by_key(|(t, _)| *t)
+            .map(|(_, p)| p)
+            .unwrap_or_else(|| self.base_save.clone())
+    }
+
+    /// Fills `slots` for the slot picker. The autosave is listed only for loading.
+    pub fn refresh_slots(&mut self, for_load: bool) {
+        let mut v: Vec<(String, PathBuf)> = self.slot_paths();
+        if for_load {
+            v.push(("Autosave".into(), self.autosave_path()));
         }
+        self.slots = v
+            .into_iter()
+            .map(|(label, path)| slot_info(label, path))
+            .collect();
     }
 
     pub fn title_items(&self) -> Vec<&'static str> {
@@ -149,7 +277,11 @@ impl App {
         if self.save_exists() {
             v.push("Continue");
         }
-        v.extend(["New game", "Help", "Quit"]);
+        v.push("New game");
+        if self.save_exists() {
+            v.push("Load game");
+        }
+        v.extend(["Help", "Quit"]);
         v
     }
 
@@ -172,35 +304,46 @@ impl App {
         self.game = Some(g);
         self.modal = Modal::None;
         self.selected = None;
+        self.selected_recipe = None;
         self.paint = false;
         self.paused = false;
+        self.area_anchor = None;
+        self.blueprint = None;
+        self.undo.clear();
+        self.camera.set(None);
+        self.drag = None;
     }
 
-    /// Loads the main save (F9, menu Load).
-    pub fn load_game(&mut self) -> Result<(), String> {
-        let g = Game::load(&self.save_path)?;
-        self.start(g);
-        Ok(())
-    }
-
-    /// Loads whichever of the main save and the autosave is newer (Continue, --continue).
-    pub fn continue_game(&mut self) -> Result<(), String> {
-        let path = self.newest_save();
+    /// Loads `path`. Loading the autosave keeps the current slot for later saves.
+    pub fn load_from(&mut self, path: PathBuf) -> Result<(), String> {
         let mut g = Game::load(&path)?;
-        if path != self.save_path {
+        if path == self.autosave_path() {
             g.log("Continued from the autosave.");
+        } else {
+            self.save_path = path;
         }
         self.start(g);
         Ok(())
     }
 
+    /// Loads the newest save of any slot (Continue, --continue).
+    pub fn continue_game(&mut self) -> Result<(), String> {
+        let path = self.newest_save();
+        self.load_from(path)
+    }
+
     pub fn save_game(&mut self) {
         let path = self.save_path.clone();
+        self.save_to(path);
+    }
+
+    pub fn save_to(&mut self, path: PathBuf) {
         if let Some(g) = self.game.as_mut() {
             match g.save(&path) {
                 Ok(()) => {
                     g.log(format!("Saved to {}", path.display()));
                     self.last_autosave_tick = g.world.tick;
+                    self.save_path = path;
                 }
                 Err(e) => g.log(format!("Save failed: {e}")),
             }
@@ -232,7 +375,11 @@ impl App {
             && !self.paused
             && !matches!(
                 self.modal,
-                Modal::Menu { .. } | Modal::Help { .. } | Modal::Victory
+                Modal::Menu { .. }
+                    | Modal::Help { .. }
+                    | Modal::Victory
+                    | Modal::Confirm { .. }
+                    | Modal::Slots { .. }
             )
     }
 
@@ -251,7 +398,8 @@ impl App {
             self.modal = Modal::Victory;
         }
         let tps = crate::world::TICKS_PER_SEC as u64;
-        if g.world.tick >= self.last_autosave_tick + AUTOSAVE_SECS * tps {
+        let every = self.settings.autosave_minutes * 60 * tps;
+        if every > 0 && g.world.tick >= self.last_autosave_tick + every {
             self.autosave();
         }
     }
@@ -260,6 +408,10 @@ impl App {
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             self.autosave();
             self.quit = true;
+            return;
+        }
+        if let Modal::Slots { save, sel } = self.modal {
+            self.slots_key(k, save, sel);
             return;
         }
         if self.game.is_none() {
@@ -332,11 +484,12 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.modal = Modal::None;
                     match action {
-                        ConfirmAction::LoadSave => {
-                            if let Err(e) = self.load_game() {
+                        ConfirmAction::LoadFrom(path) => {
+                            if let Err(e) = self.load_from(path) {
                                 self.game().log(e);
                             }
                         }
+                        ConfirmAction::SaveOver(path) => self.save_to(path),
                         ConfirmAction::QuitWithoutSaving => self.quit = true,
                     }
                 }
@@ -345,6 +498,8 @@ impl App {
                 }
                 _ => {}
             },
+            Modal::Minimap => self.minimap_key(k),
+            Modal::Slots { .. } => {}
         }
     }
 
@@ -392,6 +547,7 @@ impl App {
                     }
                 }
                 "New game" => self.new_game(),
+                "Load game" => self.open_slots(false),
                 "Help" => self.modal = Modal::Help { scroll: 0 },
                 _ => self.quit = true,
             },
@@ -399,8 +555,163 @@ impl App {
         }
     }
 
+    fn open_slots(&mut self, save: bool) {
+        self.refresh_slots(!save);
+        let sel = self
+            .slots
+            .iter()
+            .position(|s| s.path == self.save_path)
+            .unwrap_or(0);
+        self.modal = Modal::Slots { save, sel };
+    }
+
+    fn slots_key(&mut self, k: KeyEvent, save: bool, sel: usize) {
+        let n = self.slots.len().max(1);
+        match k.code {
+            KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
+                self.modal = Modal::Slots {
+                    save,
+                    sel: (sel + n - 1) % n,
+                }
+            }
+            KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('j') => {
+                self.modal = Modal::Slots {
+                    save,
+                    sel: (sel + 1) % n,
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let Some(slot) = self.slots.get(sel).cloned() else {
+                    return;
+                };
+                self.modal = Modal::None;
+                if save {
+                    if slot.exists && slot.path != self.save_path {
+                        self.modal = Modal::Confirm {
+                            action: ConfirmAction::SaveOver(slot.path),
+                        };
+                    } else {
+                        self.save_to(slot.path);
+                    }
+                } else if !slot.exists {
+                    self.modal = Modal::Slots { save, sel };
+                } else if self.game.is_some() {
+                    self.modal = Modal::Confirm {
+                        action: ConfirmAction::LoadFrom(slot.path),
+                    };
+                } else if let Err(e) = self.load_from(slot.path) {
+                    self.title_msg = Some(e);
+                }
+            }
+            c if is_close(c, &[]) => self.modal = Modal::None,
+            _ => {}
+        }
+    }
+
     fn game(&mut self) -> &mut Game {
         self.game.as_mut().expect("game running")
+    }
+
+    fn cursor(&self) -> (i32, i32) {
+        self.game
+            .as_ref()
+            .map(|g| g.player.cursor)
+            .unwrap_or((0, 0))
+    }
+
+    /// Moves the cursor somewhere far away and recentres the view on it.
+    fn jump_to(&mut self, x: i32, y: i32) {
+        self.game().player.cursor = (x, y);
+        self.camera.set(None);
+    }
+
+    /// Places `item`, or swaps it for a building of the same family that is already there.
+    /// Records undo steps. Returns true if anything changed.
+    fn build_at(&mut self, x: i32, y: i32, item: Item, dir: Dir, quiet: bool) -> bool {
+        let Some(kind) = item.building() else {
+            return false;
+        };
+        let recipe = self.selected_recipe;
+        let g = self.game.as_mut().unwrap();
+        let existing = g.world.entity(x, y).map(|e| (e.kind, e.dir));
+        match existing {
+            None => match g.place(x, y, item, dir) {
+                Ok(()) => {
+                    if kind == EntityKind::Fabricator && recipe.is_some() {
+                        let _ = g.set_recipe(x, y, recipe);
+                    }
+                    self.undo.push(UndoStep::Placed { x, y, kind });
+                    true
+                }
+                Err(e) => {
+                    if !quiet {
+                        g.log(e);
+                    }
+                    false
+                }
+            },
+            Some((k, d)) if k == kind => {
+                if kind.is_belt() && d != dir {
+                    // Fast-replacing a belt with the same belt turns it.
+                    g.world.entity_mut(x, y).unwrap().dir = dir;
+                    g.world.mark_dirty();
+                    true
+                } else {
+                    false
+                }
+            }
+            Some((k, _)) if k.family().is_some() && k.family() == kind.family() => {
+                match g.replace(x, y, item, dir) {
+                    Ok(old) => {
+                        if !quiet {
+                            g.log(format!("Swapped {} for {}", old.kind.name(), kind.name()));
+                        }
+                        let steps = vec![
+                            UndoStep::removed(x, y, &old),
+                            UndoStep::Placed { x, y, kind },
+                        ];
+                        if self.undo.open {
+                            for s in steps {
+                                self.undo.push(s);
+                            }
+                        } else {
+                            self.undo.push_group(steps);
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        if !quiet {
+                            g.log(e);
+                        }
+                        false
+                    }
+                }
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Picks up the building at (x, y), recording an undo step.
+    fn remove_at(&mut self, x: i32, y: i32, quiet: bool) -> bool {
+        let g = self.game.as_mut().unwrap();
+        let Some(step) = g.world.entity(x, y).map(|e| UndoStep::removed(x, y, e)) else {
+            return false;
+        };
+        match g.remove(x, y) {
+            Ok(kind) => {
+                if !quiet {
+                    g.log(format!("Picked up {}", kind.name()));
+                }
+                self.undo.push(step);
+                true
+            }
+            Err(e) => {
+                if !quiet {
+                    g.log(e);
+                }
+                false
+            }
+        }
     }
 
     fn move_cursor(&mut self, dx: i32, dy: i32, steps: i32) {
@@ -432,23 +743,165 @@ impl App {
                     }
                 }
                 let pd = self.place_dir;
+                let occupied = self.game().world.entity(nx, ny).is_some();
+                let built = self.build_at(nx, ny, item, pd, occupied);
                 let g = self.game.as_mut().unwrap();
-                if g.world.entity(nx, ny).is_none()
-                    && let Err(e) = g.place(nx, ny, item, pd)
-                {
-                    g.log(e);
-                    if g.player.inventory.count(item) == 0 {
-                        self.paint = false;
-                    }
+                if !built && !occupied && g.player.inventory.count(item) == 0 {
+                    self.paint = false;
+                    self.undo.close();
                 }
             }
         }
     }
 
+    fn set_paint(&mut self, on: bool) {
+        if on == self.paint {
+            return;
+        }
+        self.paint = on;
+        if on {
+            self.undo.begin();
+        } else {
+            self.undo.close();
+        }
+    }
+
+    fn clear_tools(&mut self) {
+        self.selected = None;
+        self.selected_recipe = None;
+        self.blueprint = None;
+        self.area_anchor = None;
+        self.set_paint(false);
+    }
+
+    fn undo_last(&mut self) {
+        let Some(steps) = self.undo.pop() else {
+            self.game().log("Nothing to undo.");
+            return;
+        };
+        let g = self.game.as_mut().unwrap();
+        let n = steps.len();
+        let ok = steps.iter().rev().filter(|s| s.undo(g)).count();
+        if ok == n {
+            g.log(format!(
+                "Undid {n} change{}.",
+                if n == 1 { "" } else { "s" }
+            ));
+        } else {
+            g.log(format!(
+                "Undid {ok} of {n} changes (the rest no longer apply or need buildings you don't have)."
+            ));
+        }
+    }
+
+    /// Picks up everything in the selected area as one undoable action.
+    fn remove_area(&mut self) {
+        let Some(a) = self.area_anchor.take() else {
+            return;
+        };
+        let (x0, y0, x1, y1) = rect(a, self.cursor());
+        self.undo.begin();
+        let mut n = 0;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if self.remove_at(x, y, true) {
+                    n += 1;
+                }
+            }
+        }
+        self.undo.close();
+        self.game().log(format!("Picked up {n} buildings."));
+    }
+
+    fn copy_area(&mut self) {
+        let Some(a) = self.area_anchor.take() else {
+            return;
+        };
+        let cur = self.cursor();
+        let g = self.game.as_mut().unwrap();
+        match Blueprint::copy(g, a, cur) {
+            Some(bp) => {
+                g.log(format!(
+                    "Copied {} buildings. Enter places them at the cursor, r rotates, Esc drops.",
+                    bp.cells.len()
+                ));
+                let (x0, y0, _, _) = rect(a, cur);
+                g.player.cursor = (x0, y0);
+                self.selected = None;
+                self.set_paint(false);
+                self.blueprint = Some(bp);
+            }
+            None => g.log("Nothing to copy there."),
+        }
+    }
+
+    fn paste_blueprint(&mut self) {
+        let Some(bp) = self.blueprint.clone() else {
+            return;
+        };
+        let (x, y) = self.cursor();
+        let g = self.game.as_mut().unwrap();
+        let (placed, skipped, steps) = bp.paste(g, x, y);
+        if skipped > 0 {
+            g.log(format!(
+                "Placed {placed}; {skipped} couldn't be placed (blocked, or not in your inventory)."
+            ));
+        } else {
+            g.log(format!("Placed {placed} buildings."));
+        }
+        self.undo.push_group(steps);
+    }
+
+    fn next_alert(&mut self) {
+        let g = self.game.as_ref().unwrap();
+        let probs = g.problems();
+        if probs.is_empty() {
+            self.game().log("No problems right now.");
+            return;
+        }
+        let (cx, cy) = g.player.cursor;
+        let here = cy * g.world.width + cx;
+        let k = probs
+            .iter()
+            .position(|&(x, y, _, _)| y * g.world.width + x > here)
+            .unwrap_or(0);
+        let (x, y, kind, status) = probs[k];
+        self.jump_to(x, y);
+        self.game().log(format!(
+            "{} at ({x}, {y}): {} [{}/{}]",
+            kind.name(),
+            status.label(),
+            k + 1,
+            probs.len()
+        ));
+    }
+
     fn play_key(&mut self, k: KeyEvent) {
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         let big = if shift { 8 } else { 1 };
-        match k.code {
+        // Remapped action keys from settings.json.
+        let code = match k.code {
+            KeyCode::Char(c) => match self.keymap.translate(c) {
+                Some(t) => KeyCode::Char(t),
+                None => return,
+            },
+            other => other,
+        };
+        // Area selection takes a few keys of its own.
+        if self.area_anchor.is_some() {
+            match code {
+                KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+                    return self.remove_area();
+                }
+                KeyCode::Char('y') | KeyCode::Char('c') => return self.copy_area(),
+                KeyCode::Esc | KeyCode::Char('z') => {
+                    self.area_anchor = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        match code {
             KeyCode::Up => self.move_cursor(0, -1, big),
             KeyCode::Down => self.move_cursor(0, 1, big),
             KeyCode::Left => self.move_cursor(-1, 0, big),
@@ -462,49 +915,50 @@ impl App {
             KeyCode::Char('A') => self.move_cursor(-1, 0, 8),
             KeyCode::Char('D') => self.move_cursor(1, 0, 8),
             KeyCode::Enter | KeyCode::Char(' ') => {
-                let (x, y) = self.game().player.cursor;
-                if let Some(item) = self.selected {
+                let (x, y) = self.cursor();
+                if self.blueprint.is_some() {
+                    self.paste_blueprint();
+                } else if let Some(item) = self.selected {
                     let d = self.place_dir;
-                    if let Err(e) = self.game().place(x, y, item, d) {
-                        if self.game().world.entity(x, y).is_some() {
-                            self.open_entity();
-                        } else {
-                            self.game().log(e);
-                        }
+                    let occupied = self.game().world.entity(x, y).is_some();
+                    if !self.build_at(x, y, item, d, occupied) && occupied {
+                        self.open_entity();
                     }
                 } else {
                     self.open_entity();
                 }
             }
             KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
-                let (x, y) = self.game().player.cursor;
-                match self.game().remove(x, y) {
-                    Ok(kind) => self.game().log(format!("Picked up {}", kind.name())),
-                    Err(e) => self.game().log(e),
-                }
+                let (x, y) = self.cursor();
+                self.remove_at(x, y, false);
             }
             KeyCode::Char('r') => {
-                if self.selected.is_some() {
+                if let Some(bp) = self.blueprint.as_mut() {
+                    bp.rotate();
+                } else if self.selected.is_some() {
                     self.place_dir = self.place_dir.cw();
                 } else {
-                    let (x, y) = self.game().player.cursor;
+                    let (x, y) = self.cursor();
                     self.game().world.rotate(x, y);
                 }
             }
             KeyCode::Char('R') => {
-                let (x, y) = self.game().player.cursor;
+                let (x, y) = self.cursor();
                 self.game().world.rotate(x, y);
             }
             KeyCode::Char('q') => {
-                if self.selected.is_some() {
-                    self.selected = None;
-                    self.paint = false;
+                if self.selected.is_some() || self.blueprint.is_some() {
+                    self.clear_tools();
                 } else {
-                    let (x, y) = self.game().player.cursor;
-                    if let Some((kind, dir)) =
-                        self.game().world.entity(x, y).map(|e| (e.kind, e.dir))
+                    let (x, y) = self.cursor();
+                    if let Some((kind, dir, recipe)) = self
+                        .game()
+                        .world
+                        .entity(x, y)
+                        .map(|e| (e.kind, e.dir, recipe_of(&e.state)))
                     {
                         self.selected = Some(kind.item());
+                        self.selected_recipe = recipe;
                         if kind.directional() {
                             self.place_dir = dir;
                         }
@@ -516,31 +970,37 @@ impl App {
                     self.game()
                         .log("Select a building first (number keys or b), then press v to paint.");
                 } else {
-                    self.paint = !self.paint;
-                    if self.paint {
-                        let (x, y) = self.game().player.cursor;
+                    let on = !self.paint;
+                    self.set_paint(on);
+                    if on {
+                        let (x, y) = self.cursor();
                         let (item, d) = (self.selected.unwrap(), self.place_dir);
                         if self.game().world.entity(x, y).is_none() {
-                            let _ = self.game().place(x, y, item, d);
+                            self.build_at(x, y, item, d, true);
                         }
                         self.game()
                             .log("Paint mode: moving the cursor builds. Press v to stop.");
                     }
                 }
             }
+            KeyCode::Char('z') => {
+                self.blueprint = None;
+                self.set_paint(false);
+                self.area_anchor = Some(self.cursor());
+                self.game().log(
+                    "Area select: move to the other corner, then x to pick up or y to copy. Esc cancels.",
+                );
+            }
+            KeyCode::Char('u') => self.undo_last(),
+            KeyCode::Char('n') => self.next_alert(),
+            KeyCode::Char('M') => self.modal = Modal::Minimap,
             KeyCode::Char(c @ '0'..='9') => {
                 let slot = if c == '0' {
                     9
                 } else {
                     c as usize - '1' as usize
                 };
-                let item = self.game().player.hotbar[slot];
-                if self.selected == item {
-                    self.selected = None;
-                    self.paint = false;
-                } else {
-                    self.selected = item;
-                }
+                self.select_hotbar(slot);
             }
             KeyCode::Char('m') => match self.game().toggle_mining() {
                 Ok(true) => self.game().log("Mining by hand. Keep the cursor still."),
@@ -573,17 +1033,18 @@ impl App {
             KeyCode::F(9) => {
                 if self.save_path.exists() {
                     self.modal = Modal::Confirm {
-                        action: ConfirmAction::LoadSave,
+                        action: ConfirmAction::LoadFrom(self.save_path.clone()),
                     };
                 } else {
-                    self.game().log("No save yet: press F5 to save first.");
+                    self.game()
+                        .log("No save in this slot yet: press F5 to save first.");
                 }
             }
             KeyCode::Esc => {
                 if self.paint {
-                    self.paint = false;
-                } else if self.selected.is_some() {
-                    self.selected = None;
+                    self.set_paint(false);
+                } else if self.selected.is_some() || self.blueprint.is_some() {
+                    self.clear_tools();
                 } else {
                     self.modal = Modal::Menu { sel: 0 };
                 }
@@ -592,8 +1053,219 @@ impl App {
         }
     }
 
+    fn select_hotbar(&mut self, slot: usize) {
+        let item = self.game().player.hotbar[slot];
+        self.blueprint = None;
+        self.selected_recipe = None;
+        if self.selected == item {
+            self.selected = None;
+            self.set_paint(false);
+        } else {
+            self.selected = item;
+        }
+    }
+
+    fn minimap_key(&mut self, k: KeyEvent) {
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        let step = if shift { 16 } else { 4 };
+        let (dx, dy) = match k.code {
+            KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => (0, -1),
+            KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('j') => (0, 1),
+            KeyCode::Left | KeyCode::Char('a') | KeyCode::Char('h') => (-1, 0),
+            KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('l') => (1, 0),
+            KeyCode::Char('W') => (0, -4),
+            KeyCode::Char('S') => (0, 4),
+            KeyCode::Char('A') => (-4, 0),
+            KeyCode::Char('D') => (4, 0),
+            c if is_close(c, &['M']) || c == KeyCode::Enter => {
+                self.modal = Modal::None;
+                self.camera.set(None);
+                return;
+            }
+            _ => return,
+        };
+        let g = self.game();
+        let (x, y) = g.player.cursor;
+        g.player.cursor = (
+            (x + dx * step).clamp(0, g.world.width - 1),
+            (y + dy * step).clamp(0, g.world.height - 1),
+        );
+    }
+
+    // ---- Mouse ----
+
+    /// The map tile under a screen cell, if the map was drawn there.
+    pub fn tile_at(&self, col: u16, row: u16) -> Option<(i32, i32)> {
+        let r = self.map_rect.get();
+        if col < r.x || row < r.y || col >= r.x + r.width / 2 * 2 || row >= r.y + r.height {
+            return None;
+        }
+        let (cx, cy) = self.camera.get()?;
+        let (x, y) = (cx + ((col - r.x) / 2) as i32, cy + (row - r.y) as i32);
+        let w = &self.game.as_ref()?.world;
+        w.idx(x, y).map(|_| (x, y))
+    }
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) {
+        if self.game.is_none() {
+            return;
+        }
+        match self.modal {
+            Modal::None => self.map_mouse(m),
+            Modal::Minimap => self.minimap_mouse(m),
+            _ => {
+                // In menus and lists the wheel scrolls and a right click backs out.
+                let key = match m.kind {
+                    MouseEventKind::ScrollUp => KeyCode::Up,
+                    MouseEventKind::ScrollDown => KeyCode::Down,
+                    MouseEventKind::Down(MouseButton::Right) => KeyCode::Esc,
+                    _ => return,
+                };
+                self.handle_key(plain_key(key));
+            }
+        }
+    }
+
+    fn minimap_mouse(&mut self, m: MouseEvent) {
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            let geo = self.minimap_geom.get();
+            let a = geo.area;
+            if m.column >= a.x && m.row >= a.y && m.column < a.x + a.width && m.row < a.y + a.height
+            {
+                let x = (m.column - a.x) as i32 * geo.sx;
+                let y = (m.row - a.y) as i32 * geo.sy * 2;
+                let g = self.game();
+                let (w, h) = (g.world.width, g.world.height);
+                self.jump_to(x.min(w - 1), y.min(h - 1));
+                self.modal = Modal::None;
+            }
+        } else if let MouseEventKind::Down(MouseButton::Right) = m.kind {
+            self.modal = Modal::None;
+        }
+    }
+
+    fn map_mouse(&mut self, m: MouseEvent) {
+        let shift = m.modifiers.contains(KeyModifiers::SHIFT);
+        match m.kind {
+            MouseEventKind::ScrollUp if shift => self.move_cursor(-1, 0, 3),
+            MouseEventKind::ScrollDown if shift => self.move_cursor(1, 0, 3),
+            MouseEventKind::ScrollUp => self.move_cursor(0, -1, 3),
+            MouseEventKind::ScrollDown => self.move_cursor(0, 1, 3),
+            MouseEventKind::ScrollLeft => self.move_cursor(-1, 0, 3),
+            MouseEventKind::ScrollRight => self.move_cursor(1, 0, 3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self
+                    .hotbar_hits
+                    .borrow()
+                    .iter()
+                    .find(|(r, _)| {
+                        m.column >= r.x
+                            && m.column < r.x + r.width
+                            && m.row >= r.y
+                            && m.row < r.y + r.height
+                    })
+                    .map(|&(_, s)| s);
+                if let Some(slot) = hit {
+                    return self.select_hotbar(slot);
+                }
+                let Some((x, y)) = self.tile_at(m.column, m.row) else {
+                    return;
+                };
+                self.game().player.cursor = (x, y);
+                if self.area_anchor.is_some() {
+                    self.area_anchor = None;
+                }
+                if self.blueprint.is_some() {
+                    self.paste_blueprint();
+                } else if let Some(item) = self.selected {
+                    let occupied = self.game().world.entity(x, y).is_some();
+                    self.undo.begin();
+                    let built = self.build_at(x, y, item, self.place_dir, occupied);
+                    if !built && occupied && !self.paint {
+                        self.undo.close();
+                        self.open_entity();
+                    } else {
+                        self.drag = Some(Drag::Paint);
+                    }
+                } else if self.game().world.entity(x, y).is_some() {
+                    self.open_entity();
+                } else {
+                    self.area_anchor = Some((x, y));
+                    self.drag = Some(Drag::Area);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.selected.is_some() || self.blueprint.is_some() {
+                    // Like Esc: put the tool away first.
+                    self.clear_tools();
+                    return;
+                }
+                let Some((x, y)) = self.tile_at(m.column, m.row) else {
+                    return;
+                };
+                self.game().player.cursor = (x, y);
+                self.undo.begin();
+                self.remove_at(x, y, false);
+                self.drag = Some(Drag::Remove);
+            }
+            MouseEventKind::Drag(_) => {
+                let Some(target) = self.tile_at(m.column, m.row) else {
+                    return;
+                };
+                match self.drag {
+                    Some(Drag::Paint) => self.walk_to(target, true),
+                    Some(Drag::Remove) => self.walk_to(target, false),
+                    Some(Drag::Area) => self.game().player.cursor = target,
+                    None => {}
+                }
+            }
+            MouseEventKind::Up(_) => {
+                match self.drag.take() {
+                    Some(Drag::Paint) | Some(Drag::Remove) => self.undo.close(),
+                    Some(Drag::Area) => {
+                        if self.area_anchor == Some(self.cursor()) {
+                            // A plain click on empty ground just moves the cursor.
+                            self.area_anchor = None;
+                        } else {
+                            self.game()
+                                .log("Area selected: x picks up, y copies, Esc cancels.");
+                        }
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Steps the cursor towards `target` one tile at a time, building (paint) or picking up.
+    fn walk_to(&mut self, target: (i32, i32), build: bool) {
+        let was_paint = self.paint;
+        for _ in 0..512 {
+            let (cx, cy) = self.cursor();
+            if (cx, cy) == target {
+                break;
+            }
+            let (dx, dy) = if cx != target.0 {
+                ((target.0 - cx).signum(), 0)
+            } else {
+                (0, (target.1 - cy).signum())
+            };
+            if build {
+                // Reuse paint mode so belts follow the path and turn corners.
+                self.paint = true;
+                self.move_cursor(dx, dy, 1);
+            } else {
+                self.move_cursor(dx, dy, 1);
+                let (x, y) = self.cursor();
+                self.remove_at(x, y, true);
+            }
+        }
+        self.paint = was_paint;
+    }
+
     fn open_entity(&mut self) {
-        let (x, y) = self.game().player.cursor;
+        let (x, y) = self.cursor();
         if self.game().world.entity(x, y).is_some() {
             self.modal = Modal::Entity {
                 x,
@@ -694,12 +1366,53 @@ impl App {
                 self.modal = Modal::Research { sel: (sel + 1) % n }
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
+                // Research it now if nothing is running, otherwise add it (and anything it
+                // needs) to the queue. Pressing it again on a queued tech takes it back out.
+                let t = TechId(sel as u16);
+                let r = &mut self.game().world.research;
+                let msg = if r.current == Some(t) {
+                    format!("Already researching {}", t.get().name)
+                } else if r.unqueue(t) {
+                    format!("Removed {} from the queue", t.get().name)
+                } else {
+                    let was_idle = r.current.is_none();
+                    match r.enqueue(t) {
+                        Ok(_) if was_idle => match r.current {
+                            Some(c) if c == t => format!("Researching {}", t.get().name),
+                            Some(c) => format!(
+                                "Researching {} first, then the rest of the way to {}",
+                                c.get().name,
+                                t.get().name
+                            ),
+                            None => format!("Queued {}", t.get().name),
+                        },
+                        Ok(n) => format!(
+                            "Queued {}{}",
+                            t.get().name,
+                            if n > 1 {
+                                format!(" with {} prerequisite(s)", n - 1)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                        Err(e) => e,
+                    }
+                };
+                self.game().log(msg);
+            }
+            KeyCode::Char('n') => {
+                // Switch right now; the current tech keeps its progress and goes back in line.
                 let t = TechId(sel as u16);
                 let g = self.game();
                 match g.start_research(t) {
-                    Ok(()) => g.log(format!("Researching {}", t.get().name)),
+                    Ok(()) => g.log(format!("Switched to {}", t.get().name)),
                     Err(e) => g.log(e),
                 }
+            }
+            KeyCode::Char('x') => {
+                let g = self.game();
+                g.world.research.queue.clear();
+                g.log("Research queue cleared.");
             }
             c if is_close(c, &['t']) => self.modal = Modal::None,
             _ => {}
@@ -833,20 +1546,8 @@ impl App {
             KeyCode::Esc => self.modal = Modal::None,
             KeyCode::Enter | KeyCode::Char(' ') => match sel {
                 0 => self.modal = Modal::None,
-                1 => {
-                    self.save_game();
-                    self.modal = Modal::None;
-                }
-                2 => {
-                    self.modal = if self.save_path.exists() {
-                        Modal::Confirm {
-                            action: ConfirmAction::LoadSave,
-                        }
-                    } else {
-                        self.game().log("No save yet: choose Save first.");
-                        Modal::None
-                    };
-                }
+                1 => self.open_slots(true),
+                2 => self.open_slots(false),
                 3 => self.modal = Modal::Help { scroll: 0 },
                 4 => {
                     self.save_game();
@@ -863,6 +1564,63 @@ impl App {
             KeyCode::Char('q') => self.modal = Modal::None,
             _ => {}
         }
+    }
+}
+
+fn plain_key(code: KeyCode) -> KeyEvent {
+    KeyEvent {
+        code,
+        modifiers: KeyModifiers::NONE,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    }
+}
+
+/// Describes a save file for the slot picker without loading the whole game.
+fn slot_info(label: String, path: PathBuf) -> SlotInfo {
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return SlotInfo {
+            label,
+            path,
+            exists: false,
+            detail: "empty".into(),
+        };
+    };
+    let ago = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| {
+            let m = d.as_secs() / 60;
+            match m {
+                0 => "just now".to_string(),
+                1..=59 => format!("{m} min ago"),
+                60..=2879 => format!("{} h ago", m / 60),
+                _ => format!("{} days ago", m / 1440),
+            }
+        })
+        .unwrap_or_default();
+    let played = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.pointer("/world/tick").and_then(|t| t.as_u64()));
+    let detail = match played {
+        Some(t) => {
+            let secs = t / crate::world::TICKS_PER_SEC as u64;
+            format!(
+                "{}:{:02}:{:02} played · {ago}",
+                secs / 3600,
+                (secs / 60) % 60,
+                secs % 60
+            )
+        }
+        None => format!("unreadable · {ago}"),
+    };
+    SlotInfo {
+        label,
+        path,
+        exists: true,
+        detail,
     }
 }
 
@@ -974,6 +1732,174 @@ mod tests {
         assert_eq!(a.newest_save(), a.autosave_path());
         a.game = None;
         a.continue_game().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn render(a: &App) {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        t.draw(|f| crate::ui::draw(f, a)).unwrap();
+    }
+
+    fn mouse(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Screen cell of a map tile, after a render.
+    fn cell_of(a: &App, x: i32, y: i32) -> (u16, u16) {
+        let r = a.map_rect.get();
+        let (cx, cy) = a.camera.get().unwrap();
+        (r.x + ((x - cx) * 2) as u16, r.y + (y - cy) as u16)
+    }
+
+    fn flat_app() -> App {
+        let mut a = app();
+        let g = a.game.as_mut().unwrap();
+        g.world = crate::world::World::empty(60, 40, 1);
+        g.player.cursor = (30, 20);
+        a.camera.set(None);
+        render(&a);
+        a
+    }
+
+    #[test]
+    fn mouse_drag_lays_belts_and_right_click_picks_up() {
+        let mut a = flat_app();
+        a.handle_key(key(KeyCode::Char('1'))); // conveyor
+        let (c0, r0) = cell_of(&a, 25, 20);
+        a.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), c0, r0));
+        let (c1, r1) = cell_of(&a, 29, 22);
+        a.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), c1, r1));
+        a.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), c1, r1));
+        let w = &a.game.as_ref().unwrap().world;
+        for x in 25..=29 {
+            assert!(w.entity(x, 20).is_some_and(|e| e.kind.is_belt()), "{x}");
+        }
+        assert_eq!(w.entity(28, 20).unwrap().dir, Dir::East);
+        assert_eq!(w.entity(29, 21).unwrap().dir, Dir::South);
+        // The whole stroke is one undo step.
+        assert_eq!(a.undo.len(), 1);
+        a.handle_key(key(KeyCode::Char('u')));
+        assert!(a.game.as_ref().unwrap().world.entity(27, 20).is_none());
+        // Right click picks up.
+        a.handle_key(key(KeyCode::Char('q')));
+        a.game
+            .as_mut()
+            .unwrap()
+            .place(10, 10, Item::Crate, Dir::North)
+            .unwrap();
+        a.handle_key(key(KeyCode::Char('2')));
+        let (c, r) = cell_of(&a, 10, 10);
+        // First right click only puts the selected tool away.
+        a.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), c, r));
+        assert!(a.selected.is_none());
+        a.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), c, r));
+        assert!(a.game.as_ref().unwrap().world.entity(10, 10).is_none());
+    }
+
+    #[test]
+    fn placing_express_over_a_conveyor_upgrades_it() {
+        let mut a = flat_app();
+        let g = a.game.as_mut().unwrap();
+        g.place(5, 5, Item::Conveyor, Dir::East).unwrap();
+        let i = g.world.idx(5, 5).unwrap();
+        g.world.ensure_caches();
+        g.world.insert(i, Item::Cog, 1, false);
+        g.player.inventory.add(Item::ExpressConveyor, 1);
+        let belts = g.player.inventory.count(Item::Conveyor);
+        g.player.cursor = (5, 5);
+        a.selected = Some(Item::ExpressConveyor);
+        a.place_dir = Dir::East;
+        a.handle_key(key(KeyCode::Enter));
+        let g = a.game.as_ref().unwrap();
+        let e = g.world.entity(5, 5).unwrap();
+        assert_eq!(e.kind, EntityKind::ExpressConveyor);
+        // The cog stays on the belt and the old conveyor comes back.
+        assert!(matches!(&e.state, State::Belt { items } if items.len() == 1));
+        assert_eq!(g.player.inventory.count(Item::Conveyor), belts + 1);
+        // Undo puts the old conveyor back.
+        a.handle_key(key(KeyCode::Char('u')));
+        let e = a.game.as_ref().unwrap().world.entity(5, 5).unwrap();
+        assert_eq!(e.kind, EntityKind::Conveyor);
+    }
+
+    #[test]
+    fn area_copy_and_paste_with_keys() {
+        let mut a = flat_app();
+        let g = a.game.as_mut().unwrap();
+        g.place(2, 2, Item::Crate, Dir::North).unwrap();
+        g.place(3, 2, Item::Arm, Dir::East).unwrap();
+        g.player.cursor = (2, 2);
+        a.handle_key(key(KeyCode::Char('z')));
+        a.handle_key(key(KeyCode::Right));
+        a.handle_key(key(KeyCode::Char('y')));
+        assert!(a.blueprint.is_some());
+        a.game.as_mut().unwrap().player.cursor = (10, 10);
+        a.handle_key(key(KeyCode::Enter));
+        let w = &a.game.as_ref().unwrap().world;
+        assert_eq!(w.entity(10, 10).unwrap().kind, EntityKind::Crate);
+        assert_eq!(w.entity(11, 10).unwrap().kind, EntityKind::Arm);
+        // Area pick-up is one undoable action.
+        a.handle_key(key(KeyCode::Esc));
+        a.handle_key(key(KeyCode::Char('z')));
+        a.handle_key(key(KeyCode::Right));
+        a.handle_key(key(KeyCode::Char('x')));
+        assert!(a.game.as_ref().unwrap().world.entity(11, 10).is_none());
+        a.handle_key(key(KeyCode::Char('u')));
+        assert!(a.game.as_ref().unwrap().world.entity(11, 10).is_some());
+    }
+
+    #[test]
+    fn next_alert_jumps_to_a_problem() {
+        let mut a = flat_app();
+        let g = a.game.as_mut().unwrap();
+        g.player.inventory.add(Item::Fabricator, 1);
+        g.place(40, 30, Item::Fabricator, Dir::North).unwrap();
+        g.tick();
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.game.as_ref().unwrap().player.cursor, (40, 30));
+    }
+
+    #[test]
+    fn research_enter_queues_after_the_current_tech() {
+        let mut a = app();
+        let fab = TechId::by_id("fabrication").unwrap();
+        let logic = TechId::by_id("logic").unwrap();
+        a.modal = Modal::Research {
+            sel: fab.0 as usize,
+        };
+        a.handle_key(key(KeyCode::Enter));
+        a.modal = Modal::Research {
+            sel: logic.0 as usize,
+        };
+        a.handle_key(key(KeyCode::Enter));
+        let r = &a.game.as_ref().unwrap().world.research;
+        assert_eq!(r.current, Some(fab));
+        assert_eq!(r.queue, vec![logic]);
+    }
+
+    #[test]
+    fn save_slots_round_trip() {
+        let dir = std::env::temp_dir().join(format!("factuio-slots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = App::new(dir.join("save.json"), Some(5), false);
+        a.new_game();
+        a.open_slots(true);
+        a.handle_key(key(KeyCode::Down));
+        a.handle_key(key(KeyCode::Enter));
+        let slot2 = dir.join("save-2.json");
+        assert!(slot2.exists());
+        assert_eq!(a.save_path, slot2);
+        a.game = None;
+        a.open_slots(false);
+        assert!(a.slots[1].exists && !a.slots[0].exists);
+        assert!(a.slots[1].detail.contains("played"));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.game.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

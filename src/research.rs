@@ -10,6 +10,9 @@ pub struct Research {
     pub current: Option<TechId>,
     /// Completed units per tech.
     pub progress: BTreeMap<TechId, u32>,
+    /// Techs to research next, in order, once the current one finishes.
+    #[serde(default)]
+    pub queue: Vec<TechId>,
 }
 
 impl Research {
@@ -45,11 +48,18 @@ impl Research {
         if !self.is_available(t) {
             return Err(format!("{} needs its prerequisites first", t.get().name));
         }
-        self.current = Some(t);
+        self.queue.retain(|&q| q != t);
+        if let Some(old) = self.current.replace(t)
+            && old != t
+        {
+            // Switching keeps the old tech's progress and puts it back first in line.
+            self.queue.insert(0, old);
+        }
         Ok(())
     }
 
     /// Adds one completed unit to the current research. Returns the tech if this finished it.
+    /// A finished tech hands over to the first queued tech that is now available.
     pub fn add_unit(&mut self) -> Option<TechId> {
         let t = self.current?;
         let n = self.progress.entry(t).or_insert(0);
@@ -57,9 +67,59 @@ impl Research {
         if *n >= t.get().units {
             self.done.insert(t);
             self.current = None;
+            self.start_next_queued();
             return Some(t);
         }
         None
+    }
+
+    fn start_next_queued(&mut self) {
+        self.queue.retain(|q| !self.done.contains(q));
+        if let Some(k) = self.queue.iter().position(|&q| self.is_available(q)) {
+            self.current = Some(self.queue.remove(k));
+        }
+    }
+
+    /// Queues `t` along with any prerequisites it still needs, in a workable order.
+    /// Starts right away if nothing is being researched. Returns how many techs were added.
+    pub fn enqueue(&mut self, t: TechId) -> Result<usize, String> {
+        if self.is_done(t) {
+            return Err(format!("{} is already researched", t.get().name));
+        }
+        let mut order = vec![];
+        self.collect_missing(t, &mut order);
+        let before = self.queue.len();
+        for x in order {
+            if Some(x) != self.current && !self.queue.contains(&x) {
+                self.queue.push(x);
+            }
+        }
+        let added = self.queue.len() - before;
+        if self.current.is_none() {
+            self.start_next_queued();
+        }
+        if added == 0 && self.current != Some(t) {
+            return Err(format!("{} is already queued", t.get().name));
+        }
+        Ok(added)
+    }
+
+    fn collect_missing(&self, t: TechId, out: &mut Vec<TechId>) {
+        if self.is_done(t) || out.contains(&t) {
+            return;
+        }
+        for p in t.get().prereqs {
+            if let Some(p) = TechId::by_id(p) {
+                self.collect_missing(p, out);
+            }
+        }
+        out.push(t);
+    }
+
+    pub fn unqueue(&mut self, t: TechId) -> bool {
+        let n = self.queue.len();
+        self.queue.retain(|&q| q != t);
+        n != self.queue.len()
     }
 
     #[cfg(test)]
@@ -96,5 +156,23 @@ mod tests {
         assert!(r.is_unlocked(RecipeId::by_id("fabricator").unwrap()));
         assert!(r.is_available(log));
         assert_eq!(r.current, None);
+    }
+
+    #[test]
+    fn queueing_pulls_in_prerequisites_and_runs_in_order() {
+        let mut r = Research::default();
+        let optics = TechId::by_id("optics").unwrap();
+        // Optics needs Logic theory, which needs Fabrication.
+        assert_eq!(r.enqueue(optics).unwrap(), 3);
+        assert_eq!(r.current, TechId::by_id("fabrication"));
+        let mut finished = vec![];
+        for _ in 0..200 {
+            if let Some(t) = r.add_unit() {
+                finished.push(t.get().id);
+            }
+        }
+        assert_eq!(finished, vec!["fabrication", "logic", "optics"]);
+        assert!(r.queue.is_empty());
+        assert!(r.enqueue(optics).is_err());
     }
 }

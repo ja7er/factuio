@@ -275,21 +275,32 @@ struct MapView<'a> {
 }
 
 impl MapView<'_> {
+    /// The view scrolls only when the cursor gets near an edge, so clicking around doesn't
+    /// jerk the map. Remembers the result (and the map's screen area) for mouse input.
     fn camera(&self, area: Rect) -> (i32, i32, i32, i32) {
         let vw = (area.width / 2) as i32;
         let vh = area.height as i32;
         let w = &self.game.world;
         let (cx, cy) = self.game.player.cursor;
-        let cam_x = if w.width <= vw {
-            -(vw - w.width) / 2
-        } else {
-            (cx - vw / 2).clamp(0, w.width - vw)
+        let prev = self.app.camera.get();
+        let axis = |prev: Option<i32>, c: i32, view: i32, size: i32| -> i32 {
+            if size <= view {
+                return -(view - size) / 2;
+            }
+            let margin = (view / 4).min(6);
+            let mut cam = prev.unwrap_or(c - view / 2);
+            if c < cam + margin {
+                cam = c - margin;
+            }
+            if c > cam + view - 1 - margin {
+                cam = c - (view - 1 - margin);
+            }
+            cam.clamp(0, size - view)
         };
-        let cam_y = if w.height <= vh {
-            -(vh - w.height) / 2
-        } else {
-            (cy - vh / 2).clamp(0, w.height - vh)
-        };
+        let cam_x = axis(prev.map(|p| p.0), cx, vw, w.width);
+        let cam_y = axis(prev.map(|p| p.1), cy, vh, w.height);
+        self.app.camera.set(Some((cam_x, cam_y)));
+        self.app.map_rect.set(area);
         (cam_x, cam_y, vw, vh)
     }
 }
@@ -312,6 +323,10 @@ impl Widget for MapView<'_> {
         } else {
             vec![]
         };
+        let area_sel = self
+            .app
+            .area_anchor
+            .map(|a| crate::tools::rect(a, (cx, cy)));
 
         for sy in 0..vh {
             for sx in 0..vw {
@@ -405,9 +420,43 @@ impl Widget for MapView<'_> {
                     }
                 }
 
+                // Area selection and blueprint previews.
+                if let Some((x0, y0, x1, y1)) = area_sel
+                    && x >= x0
+                    && x <= x1
+                    && y >= y0
+                    && y <= y1
+                {
+                    tint = Some(((255, 200, 60), 0.35));
+                }
+                if let Some(bp) = self.app.blueprint.as_ref()
+                    && x >= cx
+                    && y >= cy
+                    && x < cx + bp.w
+                    && y < cy + bp.h
+                {
+                    if let Some(c) = bp.cells.iter().find(|c| (c.dx, c.dy) == (x - cx, y - cy)) {
+                        let ok = world.can_place(x, y, c.kind).is_ok()
+                            || world.entity(x, y).is_some_and(|e| e.kind == c.kind);
+                        let g = ghost_entity(c.kind, c.dir);
+                        cells = entity_cells(&g, ascii, bg, world.transmitted);
+                        let gbg = if ok { (60, 90, 150) } else { (150, 40, 40) };
+                        for cell in &mut cells {
+                            cell.2 = gbg;
+                        }
+                        tint = None;
+                    } else {
+                        tint = Some(((80, 120, 200), 0.2));
+                    }
+                }
+
                 // Ghost / cursor.
                 let is_cursor = (x, y) == (cx, cy);
-                if is_cursor {
+                if is_cursor && self.app.blueprint.is_some() {
+                    for c in &mut cells {
+                        c.2 = blend(c.2, (230, 230, 230), 0.35);
+                    }
+                } else if is_cursor {
                     if let Some(k) = selected_kind
                         && world.entity(x, y).is_none()
                     {
@@ -510,6 +559,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let Modal::Help { scroll } = app.modal {
         draw_help(f, scroll);
     }
+    if let Modal::Slots { save, sel } = app.modal {
+        draw_slots(f, app, save, sel);
+    }
 }
 
 const LOGO: &[&str] = &[
@@ -601,6 +653,7 @@ fn draw_game(f: &mut Frame, app: &App, game: &Game) {
         Modal::Victory => draw_victory(f, game),
         Modal::Log { scroll } => draw_log(f, game, *scroll),
         Modal::Confirm { action } => draw_confirm(f, action.question()),
+        Modal::Minimap => draw_minimap(f, app, game),
         _ => {}
     }
 }
@@ -648,6 +701,9 @@ fn draw_top(f: &mut Frame, app: &App, game: &Game, area: Rect) {
                 r.units_done(t),
                 t.get().units
             )));
+            if !r.queue.is_empty() {
+                spans.push(dim(format!(" +{} queued", r.queue.len())));
+            }
         }
         None if r.all_done() => spans.push(Span::styled(
             "All research complete",
@@ -926,23 +982,106 @@ fn draw_sidebar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
         game.objective(),
         Style::default().fg(col((255, 220, 140))),
     )));
-    lines.push(Line::from(""));
-    lines.push(header("Build"));
-    match app.selected {
-        Some(item) => {
-            let k = item.building().unwrap();
-            lines.push(Line::from(vec![
-                Span::styled(item.name(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(format!(" ×{}", game.player.inventory.count(item))),
-                if k.directional() {
-                    Span::raw(format!(" {}", app.place_dir.arrow(app.ascii)))
-                } else {
-                    Span::raw("")
-                },
-            ]));
-            lines.push(Line::from(dim(k.description())));
+    let problems = game.problems();
+    if !problems.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("Alerts ({})", problems.len()),
+                Style::default()
+                    .fg(col((255, 110, 110)))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            dim("  n: next"),
+        ]));
+        let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
+        for (_, _, _, s) in &problems {
+            *by.entry(s.label()).or_insert(0) += 1;
         }
-        None => lines.push(Line::from(dim("nothing selected (1-0, b)"))),
+        let text = by
+            .iter()
+            .map(|(l, n)| format!("{n} {l}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(Span::styled(
+            text,
+            Style::default().fg(col((255, 160, 140))),
+        )));
+    }
+    lines.push(Line::from(""));
+    if let Some(a) = app.area_anchor {
+        let (x0, y0, x1, y1) = crate::tools::rect(a, (x, y));
+        lines.push(header("Area"));
+        lines.push(Line::from(format!(
+            "{} × {} tiles",
+            x1 - x0 + 1,
+            y1 - y0 + 1
+        )));
+        lines.push(Line::from(vec![
+            key("x"),
+            dim(" pick up  "),
+            key("y"),
+            dim(" copy  "),
+            key("Esc"),
+            dim(" cancel"),
+        ]));
+    } else if let Some(bp) = app.blueprint.as_ref() {
+        lines.push(header("Blueprint"));
+        lines.push(Line::from(format!(
+            "{} buildings, {} × {}",
+            bp.cells.len(),
+            bp.w,
+            bp.h
+        )));
+        let short: Vec<String> = bp
+            .cost()
+            .iter()
+            .filter_map(|(it, n)| {
+                let have = game.player.inventory.count(it);
+                (have < n).then(|| format!("{} {}", n - have, it.name()))
+            })
+            .collect();
+        if !short.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("Short: {}", short.join(", ")),
+                Style::default().fg(col((255, 170, 90))),
+            )));
+        }
+        lines.push(Line::from(vec![
+            key("Enter"),
+            dim(" place  "),
+            key("r"),
+            dim(" rotate  "),
+            key("Esc"),
+            dim(" drop"),
+        ]));
+    } else {
+        lines.push(header("Build"));
+        match app.selected {
+            Some(item) => {
+                let k = item.building().unwrap();
+                lines.push(Line::from(vec![
+                    Span::styled(item.name(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(" ×{}", game.player.inventory.count(item))),
+                    if k.directional() {
+                        Span::raw(format!(" {}", app.place_dir.arrow(app.ascii)))
+                    } else {
+                        Span::raw("")
+                    },
+                ]));
+                if let Some(r) = app.selected_recipe {
+                    lines.push(Line::from(vec![
+                        dim("recipe: "),
+                        item_span(r.get().main_output()),
+                    ]));
+                }
+                lines.push(Line::from(dim(k.description())));
+            }
+            None => lines.push(Line::from(dim("nothing selected (1-0, b)"))),
+        }
+    }
+    if !app.undo.is_empty() {
+        lines.push(Line::from(dim(format!("u: undo ({})", app.undo.len()))));
     }
     if let Some((mx, my)) = game.player.mining {
         lines.push(Line::from(""));
@@ -977,10 +1116,14 @@ fn draw_sidebar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
 
 fn draw_hotbar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
     let mut spans = vec![];
+    let mut hits = vec![];
+    let mut x = area.x;
     for (k, slot) in game.player.hotbar.iter().enumerate() {
         let n = if k == 9 { 0 } else { k + 1 };
         let Some(item) = slot else {
-            spans.push(dim(format!(" {n}:-  ")));
+            let s = format!(" {n}:-  ");
+            x += s.chars().count() as u16;
+            spans.push(dim(s));
             continue;
         };
         let count = game.player.inventory.count(*item);
@@ -999,9 +1142,14 @@ fn draw_hotbar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
         } else {
             Style::default().fg(col((230, 230, 230)))
         };
-        spans.push(Span::styled(format!(" {n}:{name} {count} "), style));
+        let label = format!(" {n}:{name} {count} ");
+        let w = label.chars().count() as u16;
+        hits.push((Rect::new(x, area.y, w, 1), k));
+        x += w + 1;
+        spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
     }
+    *app.hotbar_hits.borrow_mut() = hits;
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(col((30, 30, 40)))),
         area,
@@ -1169,6 +1317,15 @@ fn draw_craft(f: &mut Frame, app: &App, game: &Game, sel: usize) {
             )));
         }
     }
+    let used: Vec<&str> = crate::recipes::RecipeId::consumers(rec.main_output())
+        .iter()
+        .map(|r| r.get().name())
+        .collect();
+    if !used.is_empty() {
+        lines.push(Line::from(dim(format!("Used in: {}", used.join(", ")))));
+    } else if rec.main_output().is_pack() {
+        lines.push(Line::from(dim("Used in: labs, for research")));
+    }
     lines.push(Line::from(vec![
         key("Enter"),
         dim(" craft 1  "),
@@ -1288,18 +1445,24 @@ fn draw_research(f: &mut Frame, app: &App, game: &Game, sel: usize) {
     let rows: Vec<Line> = TechId::all()
         .enumerate()
         .map(|(k, t)| {
+            let queued = r.queue.iter().position(|&q| q == t);
             let (mark, c) = if r.is_done(t) {
-                (if app.ascii { "+" } else { "✓" }, col((120, 230, 120)))
+                (
+                    if app.ascii { "+" } else { "✓" }.to_string(),
+                    col((120, 230, 120)),
+                )
             } else if r.current == Some(t) {
-                (">", col((120, 220, 255)))
+                (">".to_string(), col((120, 220, 255)))
+            } else if let Some(q) = queued {
+                (format!("{}", q + 1), col((180, 200, 255)))
             } else if r.is_available(t) {
-                ("o", col((240, 240, 240)))
+                ("o".to_string(), col((240, 240, 240)))
             } else {
-                ("x", col((110, 110, 110)))
+                ("x".to_string(), col((110, 110, 110)))
             };
             list_line(
                 vec![Span::styled(
-                    format!(" {mark} {:<24}", t.get().name),
+                    format!(" {mark:>1} {:<24}", t.get().name),
                     Style::default().fg(c),
                 )],
                 k == sel,
@@ -1359,18 +1522,39 @@ fn draw_research(f: &mut Frame, app: &App, game: &Game, sel: usize) {
             "In progress: feed labs with datapacks",
             Style::default().fg(col((120, 220, 255))),
         )
+    } else if let Some(q) = r.queue.iter().position(|&q| q == t) {
+        Span::styled(
+            format!("Queued #{}: Enter removes it", q + 1),
+            Style::default().fg(col((180, 200, 255))),
+        )
     } else if r.is_available(t) {
         Span::styled(
-            "Press Enter to research",
+            if r.current.is_some() {
+                "Enter: add to queue"
+            } else {
+                "Enter: research"
+            },
             Style::default().fg(col((255, 210, 90))),
         )
     } else {
         Span::styled(
-            "Locked: research prerequisites first",
-            Style::default().fg(col((255, 120, 120))),
+            "Enter: queue it with its prerequisites",
+            Style::default().fg(col((255, 160, 110))),
         )
     };
     lines.push(Line::from(status));
+    if !r.queue.is_empty() {
+        let names: Vec<_> = r.queue.iter().map(|q| q.get().name).collect();
+        lines.push(Line::from(dim(format!("Queue: {}", names.join(" → ")))));
+    }
+    lines.push(Line::from(vec![
+        key("Enter"),
+        dim(" research/queue  "),
+        key("n"),
+        dim(" switch now  "),
+        key("x"),
+        dim(" clear queue"),
+    ]));
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }),
         right.inner(ratatui::layout::Margin::new(1, 0)),
@@ -1580,6 +1764,132 @@ fn draw_log(f: &mut Frame, game: &Game, scroll: u16) {
     f.render_widget(Paragraph::new(dim("↑/↓ scroll · Esc close")), foot);
 }
 
+fn draw_slots(f: &mut Frame, app: &App, save: bool, sel: usize) {
+    let area = centered(f.area(), 60, app.slots.len() as u16 * 2 + 5);
+    f.render_widget(Clear, area);
+    let block = modal_block(if save { "Save to slot" } else { "Load a save" });
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let mut lines = vec![];
+    for (k, s) in app.slots.iter().enumerate() {
+        let current = s.path == app.save_path;
+        let label = format!(" {}{}", s.label, if current { "  (current)" } else { "" });
+        let style = if s.exists {
+            Style::default()
+        } else {
+            Style::default().fg(col((120, 120, 120)))
+        };
+        lines.push(list_line(vec![Span::styled(label, style)], k == sel));
+        lines.push(Line::from(dim(format!("   {}", s.detail))));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        key("Enter"),
+        dim(if save { " save here  " } else { " load  " }),
+        key("Esc"),
+        dim(" back"),
+    ]));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The whole map, two tiles per terminal cell vertically using half blocks.
+fn draw_minimap(f: &mut Frame, app: &App, game: &Game) {
+    let full = f.area();
+    let area = centered(
+        full,
+        full.width.saturating_sub(4),
+        full.height.saturating_sub(2),
+    );
+    f.render_widget(Clear, area);
+    let block = modal_block("Map overview");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [body, foot] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let w = &game.world;
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    // Tiles per cell horizontally, and per half-cell vertically.
+    let sx = (w.width as f32 / body.width as f32).ceil().max(1.0) as i32;
+    let sy = (w.height as f32 / (body.height as f32 * 2.0))
+        .ceil()
+        .max(1.0) as i32;
+    let s = sx.max(sy);
+    let (sx, sy) = (s, s);
+    let cols = ((w.width + sx - 1) / sx).min(body.width as i32);
+    let rows = ((w.height + sy * 2 - 1) / (sy * 2)).min(body.height as i32);
+    let ox = body.x + (body.width - cols as u16) / 2;
+    let oy = body.y + (body.height - rows as u16) / 2;
+    app.minimap_geom.set(crate::app::MinimapGeom {
+        area: Rect::new(ox, oy, cols as u16, rows as u16),
+        sx,
+        sy,
+    });
+    // Colour of the block of tiles starting at (x, y): buildings win, then ore, then terrain.
+    let sample = |x0: i32, y0: i32| -> Rgb {
+        let mut ore = None;
+        let mut terrain = None;
+        for y in y0..(y0 + sy).min(w.height) {
+            for x in x0..(x0 + sx).min(w.width) {
+                if let Some(e) = w.entity(x, y) {
+                    return blend(entity_bg(e.kind), (255, 255, 255), 0.25);
+                }
+                let t = w.tile(x, y).unwrap();
+                if let Some(o) = t.ore {
+                    ore = Some(o);
+                }
+                terrain.get_or_insert(t.terrain);
+            }
+        }
+        match (ore, terrain) {
+            (Some(o), _) => blend(ore_bg(o), item_rgb(o), 0.3),
+            (None, Some(t)) => terrain_bg(t),
+            _ => (0, 0, 0),
+        }
+    };
+    let (cx, cy) = game.player.cursor;
+    let buf = f.buffer_mut();
+    for r in 0..rows {
+        for c in 0..cols {
+            let (x, y) = (c * sx, r * sy * 2);
+            let mut top = sample(x, y);
+            let mut bot = if y + sy < w.height {
+                sample(x, y + sy)
+            } else {
+                (12, 12, 16)
+            };
+            let in_cell = |yy: i32| cx >= x && cx < x + sx && cy >= yy && cy < yy + sy;
+            if in_cell(y) {
+                top = (255, 255, 255);
+            }
+            if in_cell(y + sy) {
+                bot = (255, 255, 255);
+            }
+            if let Some(cell) = buf.cell_mut((ox + c as u16, oy + r as u16)) {
+                if app.ascii {
+                    cell.set_char(' ')
+                        .set_style(Style::default().bg(col(blend(top, bot, 0.5))));
+                } else {
+                    cell.set_char('▀')
+                        .set_style(Style::default().fg(col(top)).bg(col(bot)));
+                }
+            }
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            dim(format!("1 cell = {sx}×{} tiles · ", sy * 2)),
+            key("arrows"),
+            dim(" move cursor  "),
+            key("click"),
+            dim(" jump  "),
+            key("Esc"),
+            dim(" back"),
+        ])),
+        foot,
+    );
+}
+
 fn draw_confirm(f: &mut Frame, question: &str) {
     let area = centered(f.area(), 50, 7);
     f.render_widget(Clear, area);
@@ -1632,7 +1942,17 @@ GOAL
 
 MOVING AROUND
   Arrows / WASD        move the cursor (Shift or capital WASD: 8 tiles)
-  The map scrolls with the cursor. The sidebar describes what's under it.
+  M                    map overview (click or move, Enter to return)
+  n                    jump to the next building with a problem
+  The map scrolls when the cursor nears an edge. The sidebar describes
+  what's under the cursor and lists alerts.
+
+MOUSE
+  left click           place the selected building, or inspect
+  left drag            lay buildings along the path (belts turn corners);
+                       with nothing selected, select an area
+  right click / drag   pick up (first right click puts a tool away)
+  wheel                scroll (Shift+wheel: sideways); click the hotbar
 
 BUILDING
   1-9, 0               select a building from the hotbar (again to clear)
@@ -1643,6 +1963,14 @@ BUILDING
                        conveyors follow the direction you move and turn corners
   q                    clear selection / pick the building under the cursor
   x / Delete           pick up a building and everything inside it
+  u                    undo the last build or pick-up (a whole paint
+                       stroke, drag or paste counts as one)
+  z                    select an area: move to the other corner, then
+                         x pick up everything, y copy it as a blueprint
+  Blueprints           Enter places a copy at the cursor, r rotates it,
+                       Esc drops it. Fabricators keep their recipes.
+  Upgrading            placing an express conveyor, swift arm, bore or
+                       arc furnace over its basic version swaps it in place
   o                    toggle the power coverage overlay
 
 INTERACTING
@@ -1652,15 +1980,26 @@ INTERACTING
   m                    mine the ore under the cursor by hand (keep still)
   c / i / Tab          crafting and inventory
                          Enter craft 1, f craft 5, F craft max, x cancel
-  t                    research tree (Enter to pick what labs work on)
+  t                    research tree: Enter researches a tech, or queues
+                       it (with anything it needs) after the current one;
+                       n switches right away, x clears the queue
   g                    production statistics
   l                    message log
 
 GAME
   p pause   f fast-forward (4x)   F5 quick save   F9 quick load
-  Esc menu (save, load, quit). The game autosaves every 5 minutes,
-  and when you press Ctrl+C or close the terminal, to a separate
-  autosave file; Continue picks whichever save is newer.
+  Esc menu: save to or load any of 5 slots, quit. F5/F9 use the slot
+  you last saved to or loaded. The game autosaves every 5 minutes, and
+  when you press Ctrl+C or close the terminal, to a separate autosave
+  file; Continue picks whichever save is newest.
+
+SETTINGS
+  settings.json next to your save (~/.factuio/) turns the mouse off,
+  changes the autosave interval, and remaps keys, for example
+  "keys": {"mine": "k", "undo": "U"}. Remappable actions: rotate,
+  paint, pick, remove, inspect, mine, build_menu, craft, research,
+  stats, log, power_overlay, pause, fast, select_area, undo,
+  next_alert, minimap.
 
 MAP LEGEND
   :: .       ore (brighter = richer). ferrite (blue), malachite (green),
@@ -1790,8 +2129,13 @@ mod tests {
             Modal::Stats,
             Modal::Victory,
             Modal::Log { scroll: 2 },
+            Modal::Minimap,
+            Modal::Slots {
+                save: false,
+                sel: 0,
+            },
             Modal::Confirm {
-                action: crate::app::ConfirmAction::LoadSave,
+                action: crate::app::ConfirmAction::QuitWithoutSaving,
             },
         ];
         for m in modals {

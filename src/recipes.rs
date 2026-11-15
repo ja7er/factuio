@@ -112,6 +112,13 @@ impl RecipeId {
         (0..RECIPES.len()).map(|i| RecipeId(i as u16))
     }
 
+    /// Recipes (of any category) that use `item` as an ingredient.
+    pub fn consumers(item: Item) -> Vec<RecipeId> {
+        RecipeId::all()
+            .filter(|r| r.get().inputs.iter().any(|&(i, _)| i == item))
+            .collect()
+    }
+
     /// The crafting recipe that makes `item`, if any.
     pub fn producing(item: Item) -> Option<RecipeId> {
         RecipeId::all()

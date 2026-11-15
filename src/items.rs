@@ -249,6 +249,17 @@ impl EntityKind {
         }
     }
 
+    /// Buildings in the same family can be swapped in place (upgrade or downgrade).
+    pub fn family(self) -> Option<u8> {
+        match self {
+            EntityKind::Conveyor | EntityKind::ExpressConveyor => Some(0),
+            EntityKind::Arm | EntityKind::SwiftArm => Some(1),
+            EntityKind::Digger | EntityKind::Bore => Some(2),
+            EntityKind::Kiln | EntityKind::ArcFurnace => Some(3),
+            _ => None,
+        }
+    }
+
     pub fn is_belt(self) -> bool {
         matches!(self, EntityKind::Conveyor | EntityKind::ExpressConveyor)
     }

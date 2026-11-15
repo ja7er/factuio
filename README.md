@@ -58,23 +58,56 @@ advertises it through `COLORTERM`; otherwise they fall back to the 256-colour pa
 | Space / Enter | Place the selected building, or inspect what's under the cursor |
 | r | Rotate the building you're placing (or the one under the cursor) |
 | v | Paint mode: moving the cursor keeps building; conveyors follow your path |
-| q | Clear selection / pick the building under the cursor |
+| q | Clear selection / pick the building under the cursor (fabricators keep their recipe) |
 | x / Delete | Pick up a building and everything inside it |
+| u | Undo the last build or pick-up (a paint stroke, drag or paste is one step) |
+| z | Select an area, then `x` to pick it all up or `y` to copy it as a blueprint |
 | e | Inspect: `t` take, `i` insert, `f` add fuel, `r` recipe or rotate |
 | m | Mine the ore under the cursor by hand |
 | c / i / Tab | Crafting and inventory (`Enter` 1, `f` 5, `F` max, `x` cancel) |
-| t | Research tree |
+| t | Research tree (`Enter` research or queue, `n` switch now, `x` clear queue) |
 | g | Production statistics (rates over the last minute) |
 | l | Message log |
+| n | Jump to the next building with a problem |
+| M | Map overview |
 | o | Power coverage overlay |
 | p / f | Pause / 4× fast-forward |
-| F5 / F9 | Quick save / quick load (asks first) |
-| Esc | Menu (save, load, quit) |
+| F5 / F9 | Quick save / quick load the current slot (asks first) |
+| Esc | Menu (save to or load one of 5 slots, quit) |
 | ? | Help |
+
+**Mouse:** left click places or inspects, left drag lays buildings along the path (or selects an
+area when nothing is selected), right click or drag picks up, the wheel scrolls, and the hotbar
+is clickable.
+
+**Upgrading in place:** placing an express conveyor, swift arm, electric bore or arc furnace over
+its basic version swaps it, and the old one goes back to your inventory.
+
+**Blueprints:** copy an area with `z` … `y`, then `Enter` places it at the cursor, `r` rotates
+it and `Esc` drops it.
 
 The game autosaves every five minutes, and when you press Ctrl+C or close the terminal,
 to a separate `save.autosave.json`, so it never overwrites a save you made yourself.
-**Continue** picks whichever is newer. Every save also keeps the previous file as `.bak`.
+**Continue** picks whichever save is newest. Every save also keeps the previous file as `.bak`.
+
+### Settings
+
+`~/.factuio/settings.json` (next to your save) is created on first run:
+
+```json
+{
+  "mouse": true,
+  "palette": "default",
+  "ascii": false,
+  "autosave_minutes": 5,
+  "keys": { "mine": "k" }
+}
+```
+
+`keys` remaps play-screen actions: `rotate`, `paint`, `pick`, `remove`, `inspect`, `mine`,
+`build_menu`, `craft`, `research`, `stats`, `log`, `power_overlay`, `pause`, `fast`,
+`select_area`, `undo`, `next_alert`, `minimap`. Set `autosave_minutes` to 0 to turn autosave
+off, and `mouse` to false to keep your terminal's own text selection.
 
 ## How it plays
 
