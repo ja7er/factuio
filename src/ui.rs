@@ -5,7 +5,7 @@ use crate::game::Game;
 use crate::items::{Dir, EntityKind, Item};
 use crate::recipes::TechId;
 use crate::world::{
-    ArmPhase, CRATE_CAP, Entity, PYLON_SUPPLY, State, Status, Terrain, UPLINK_GOAL,
+    ArmPhase, CRATE_CAP, Entity, PYLON_SUPPLY, State, Status, TUNNEL_REACH, Terrain, UPLINK_GOAL,
 };
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -103,6 +103,8 @@ fn entity_bg(k: EntityKind) -> Rgb {
     match k {
         EntityKind::Conveyor => (58, 58, 54),
         EntityKind::ExpressConveyor => (72, 52, 92),
+        EntityKind::Splitter => (70, 76, 40),
+        EntityKind::TunnelIn | EntityKind::TunnelOut => (34, 66, 72),
         EntityKind::Digger => (96, 72, 30),
         EntityKind::Bore => (110, 90, 20),
         EntityKind::Kiln => (104, 44, 24),
@@ -114,7 +116,18 @@ fn entity_bg(k: EntityKind) -> Rgb {
         EntityKind::SunPanel => (24, 36, 100),
         EntityKind::Lab => (30, 92, 92),
         EntityKind::Uplink => (120, 120, 150),
-        EntityKind::Arm | EntityKind::SwiftArm => (40, 40, 40),
+        EntityKind::Arm | EntityKind::SwiftArm | EntityKind::LongArm | EntityKind::FilterArm => {
+            (40, 40, 40)
+        }
+    }
+}
+
+fn arm_rgb(k: EntityKind) -> Rgb {
+    match k {
+        EntityKind::SwiftArm => (90, 220, 240),
+        EntityKind::LongArm => (255, 150, 70),
+        EntityKind::FilterArm => (220, 140, 255),
+        _ => (240, 210, 80),
     }
 }
 
@@ -150,30 +163,45 @@ fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32) -> Cel
     let dim = (130, 130, 130);
     let letter = |c: char| (c, st, bg, true);
     match &e.state {
-        State::Belt { items } => {
+        State::Belt { items, .. } => {
             let arrow = e.dir.arrow(ascii);
             let mut out = [(arrow, dim, bg, false), (arrow, dim, bg, false)];
+            // Display order follows the belt direction: `slot(0)` is the back half.
+            let slot = |half: usize| match e.dir {
+                Dir::East | Dir::South => half,
+                Dir::West | Dir::North => 1 - half,
+            };
+            // Each special piece keeps one half for its own mark and carries items in the other.
+            let mark_fg = if e.status.is_problem() {
+                (255, 90, 90)
+            } else {
+                (235, 225, 170)
+            };
+            let (mark, shown) = match e.kind {
+                EntityKind::Splitter => (Some((0, 'Y')), Some(1)),
+                EntityKind::TunnelIn => (Some((1, if ascii { 'u' } else { '∪' })), Some(0)),
+                EntityKind::TunnelOut => (Some((0, if ascii { 'n' } else { '∩' })), Some(1)),
+                _ => (None, None),
+            };
             for b in items {
-                let half = if b.pos < crate::world::TILE_LEN / 2 {
+                // What's underground in a tunnel entrance isn't drawn.
+                if b.pos > crate::world::TILE_LEN {
+                    continue;
+                }
+                let half = shown.unwrap_or(if b.pos < crate::world::TILE_LEN / 2 {
                     0
                 } else {
                     1
-                };
-                // Display order follows the belt direction.
-                let slot = match e.dir {
-                    Dir::East | Dir::South => half,
-                    Dir::West | Dir::North => 1 - half,
-                };
-                out[slot] = (b.item.glyph(), item_rgb(b.item), bg, true);
+                });
+                out[slot(half)] = (b.item.glyph(), item_rgb(b.item), bg, true);
+            }
+            if let Some((half, c)) = mark {
+                out[slot(half)] = (c, mark_fg, bg, true);
             }
             out
         }
         State::Arm { hand, .. } => {
-            let base = if e.kind == EntityKind::SwiftArm {
-                (90, 220, 240)
-            } else {
-                (240, 210, 80)
-            };
+            let base = arm_rgb(e.kind);
             let fg = if e.status.is_problem() {
                 (255, 90, 90)
             } else {
@@ -318,6 +346,17 @@ impl Widget for MapView<'_> {
         let focus = selected_kind
             .map(|k| (k, self.app.place_dir))
             .or(hover_kind);
+        // The other end of the tunnel under the cursor, or the entrance a new piece would join.
+        let tunnel_mate = match (selected_kind, hover_kind) {
+            (Some(k), _) if k.is_tunnel() => {
+                world.tunnel_entrance_behind(cx, cy, self.app.place_dir)
+            }
+            (None, Some((k, _))) if k.is_tunnel() => {
+                world.idx(cx, cy).and_then(|i| world.tunnel_pair(i))
+            }
+            _ => None,
+        }
+        .map(|i| world.pos(i));
         let pylons = if self.power_overlay_active(focus) {
             world.pylons()
         } else {
@@ -412,10 +451,22 @@ impl Widget for MapView<'_> {
                         tint = Some(((80, 255, 120), 0.3));
                     }
                     if k.is_arm() {
-                        if (x, y) == (cx - dx, cy - dy) {
+                        let n = k.arm_reach();
+                        if (x, y) == (cx - dx * n, cy - dy * n) {
                             tint = Some(((80, 255, 120), 0.35));
-                        } else if (x, y) == (cx + dx, cy + dy) {
+                        } else if (x, y) == (cx + dx * n, cy + dy * n) {
                             tint = Some(((255, 150, 60), 0.4));
+                        }
+                    }
+                    if k.is_tunnel() {
+                        if tunnel_mate == Some((x, y)) {
+                            tint = Some(((80, 255, 120), 0.4));
+                        } else if tunnel_mate.is_none()
+                            && k == EntityKind::TunnelIn
+                            && (1..=TUNNEL_REACH).any(|n| (x, y) == (cx + dx * n, cy + dy * n))
+                        {
+                            // Where the exit of this entrance can go.
+                            tint = Some(((80, 200, 220), 0.25));
                         }
                     }
                 }
@@ -804,7 +855,26 @@ fn entity_detail(
         }
     }
     match &e.state {
-        State::Belt { items } => {
+        State::Belt { items, .. } => {
+            if e.kind.is_tunnel() {
+                let mate = w.idx(x, y).and_then(|i| w.tunnel_pair(i));
+                lines.push(match mate {
+                    Some(j) => {
+                        let (mx, my) = w.pos(j);
+                        let gap = (mx - x).abs() + (my - y).abs() - 1;
+                        let end = if e.kind == EntityKind::TunnelIn {
+                            "exit"
+                        } else {
+                            "entrance"
+                        };
+                        Line::from(format!("Linked to an {end}, passing under {gap} tiles"))
+                    }
+                    None => Line::from(Span::styled(
+                        "Not linked: needs the other end ahead, facing the same way",
+                        Style::default().fg(col((255, 100, 100))),
+                    )),
+                });
+            }
             lines.push(Line::from(format!("Carrying {} items", items.len())));
             let mut inv = crate::inventory::Inventory::new();
             for b in items {
@@ -814,7 +884,16 @@ fn entity_detail(
                 lines.extend(inv_lines(&inv, 6));
             }
         }
-        State::Arm { hand, phase, .. } => {
+        State::Arm {
+            hand,
+            phase,
+            filter,
+            ..
+        } => {
+            if e.kind == EntityKind::FilterArm {
+                let f = filter.map(|i| i.name()).unwrap_or("anything");
+                lines.push(Line::from(format!("Moves only: {f}")));
+            }
             let h = hand.map(|i| i.name()).unwrap_or("nothing");
             lines.push(Line::from(format!("Holding: {h}")));
             let p = match phase {
@@ -1376,7 +1455,9 @@ fn draw_build(f: &mut Frame, game: &Game, sel: usize) {
     f.render_widget(block, area);
     let [left, right] =
         Layout::horizontal([Constraint::Length(28), Constraint::Min(20)]).areas(inner);
-    let rows: Vec<Line> = EntityKind::ALL
+    let kinds: Vec<EntityKind> = EntityKind::menu().collect();
+    let sel = sel.min(kinds.len() - 1);
+    let rows: Vec<Line> = kinds
         .iter()
         .enumerate()
         .map(|(k, kind)| {
@@ -1399,7 +1480,7 @@ fn draw_build(f: &mut Frame, game: &Game, sel: usize) {
         Paragraph::new(rows).scroll((scroll_for(sel, left.height), 0)),
         left,
     );
-    let kind = EntityKind::ALL[sel];
+    let kind = kinds[sel];
     let mut lines = vec![
         header(kind.name()),
         Line::from(kind.description()),
@@ -1606,6 +1687,18 @@ fn draw_entity_panel(
             } else if e.kind.directional() {
                 r.push(Line::from(vec![key("r"), Span::raw(" rotate")]));
             }
+            if e.kind == EntityKind::FilterArm {
+                r.push(Line::from(vec![
+                    key("f"),
+                    Span::raw(" choose what it moves"),
+                ]));
+            }
+            if e.kind.is_tunnel() {
+                r.push(Line::from(vec![
+                    key("v"),
+                    Span::raw(" switch entrance / exit"),
+                ]));
+            }
             r.push(Line::from(vec![key("x"), Span::raw(" pick up building")]));
             r.push(Line::from(vec![key("Esc"), Span::raw(" close")]));
         }
@@ -1643,6 +1736,20 @@ fn draw_entity_panel(
                         vec![Span::raw(" "), item_span(id.get().main_output())],
                         k == sel,
                     ),
+                })
+                .collect();
+            let h = right.height.saturating_sub(2);
+            let off = scroll_for(sel, h) as usize;
+            r.extend(rows.into_iter().skip(off).take(h as usize));
+        }
+        EntitySub::Filter => {
+            r.push(header("Move only which item?"));
+            let rows: Vec<Line> = crate::app::filter_choices()
+                .iter()
+                .enumerate()
+                .map(|(k, c)| match c {
+                    None => list_line(vec![dim(" (anything)")], k == sel),
+                    Some(it) => list_line(vec![Span::raw(" "), item_span(*it)], k == sel),
                 })
                 .collect();
             let h = right.height.saturating_sub(2);
@@ -1969,14 +2076,20 @@ BUILDING
                          x pick up everything, y copy it as a blueprint
   Blueprints           Enter places a copy at the cursor, r rotates it,
                        Esc drops it. Fabricators keep their recipes.
-  Upgrading            placing an express conveyor, swift arm, bore or
-                       arc furnace over its basic version swaps it in place
+  Upgrading            placing an express conveyor, swift or filter arm,
+                       bore or arc furnace over its basic version swaps it
+                       in place
+  Tunnels              place a tunnel belt, then another up to 5 tiles
+                       further on facing the same way: the second becomes
+                       the exit. Items travel underground between them.
   o                    toggle the power coverage overlay
 
 INTERACTING
   e                    inspect the building under the cursor:
                          t take items, i insert items, f add lignite,
-                         r choose recipe (fabricator) or rotate, x pick up
+                         r choose recipe (fabricator) or rotate, x pick up,
+                         f choose the item (filter arm),
+                         v swap entrance and exit (tunnel belt)
   m                    mine the ore under the cursor by hand (keep still)
   c / i / Tab          crafting and inventory
                          Enter craft 1, f craft 5, F craft max, x cancel
@@ -2005,7 +2118,11 @@ MAP LEGEND
   :: .       ore (brighter = richer). ferrite (blue), malachite (green),
              lignite (dark), quartz (pale)
   →  ↑       conveyor; items ride on it shown by their letter
-  ɑ→         arm: grabs from behind, drops ahead (holding item shown)
+  Y→         splitter: shares items between the belts ahead, left and right
+  →∪  ∩→     tunnel entrance and exit (ASCII: u and n)
+  ɑ→         arm: grabs from behind, drops ahead (holding item shown);
+             yellow arm, cyan swift arm, orange long arm (reaches 2
+             tiles), purple filter arm (moves one chosen item)
   D B        digger / electric bore (arrow = output side)
   K E        kiln / arc furnace     M  fabricator      C  crate
   G          generator              P  pylon           S  sun panel
@@ -2028,7 +2145,9 @@ HOW THINGS WORK
   itself must be within a pylon's reach.
   When demand exceeds supply, every machine on that grid slows down.
   Arms only pick up items the target can use, so one belt can carry
-  mixed items to several machines.
+  mixed items to several machines. A filter arm narrows that to one item.
+  A splitter takes turns between its outputs and skips one that is full
+  or missing; a belt pointing into its side merges in instead.
   Fabricators craft whatever recipe you give them, with power.
   Labs consume datapacks to research the selected technology.
 
@@ -2107,6 +2226,11 @@ mod tests {
             .unwrap()
             .place(x, y, Item::Crate, Dir::North)
             .unwrap();
+        let g = a.game.as_mut().unwrap();
+        g.player.inventory.add(Item::FilterArm, 1);
+        g.player.inventory.add(Item::Tunnel, 1);
+        g.place(x + 2, y, Item::FilterArm, Dir::East).unwrap();
+        g.place(x + 3, y, Item::Tunnel, Dir::East).unwrap();
         let modals = vec![
             Modal::None,
             Modal::Help { scroll: 3 },
@@ -2125,6 +2249,25 @@ mod tests {
                 sub: EntitySub::Insert,
                 sel: 0,
             },
+            Modal::Entity {
+                x: x + 2,
+                y,
+                sub: EntitySub::Main,
+                sel: 0,
+            },
+            Modal::Entity {
+                x: x + 2,
+                y,
+                sub: EntitySub::Filter,
+                sel: 30,
+            },
+            Modal::Entity {
+                x: x + 3,
+                y,
+                sub: EntitySub::Main,
+                sel: 0,
+            },
+            Modal::Build { sel: 40 },
             Modal::Menu { sel: 1 },
             Modal::Stats,
             Modal::Victory,
@@ -2149,6 +2292,28 @@ mod tests {
         let s = render(&a, 120, 40);
         assert!(s.contains("Cursor"));
         assert!(s.contains("Crate"));
+    }
+
+    #[test]
+    fn logistics_pieces_have_their_own_marks() {
+        for ascii in [false, true] {
+            let mut a = app();
+            a.ascii = ascii;
+            let g = a.game.as_mut().unwrap();
+            let (x, y) = g.player.cursor;
+            g.player.inventory.add(Item::Splitter, 1);
+            g.player.inventory.add(Item::Tunnel, 2);
+            g.place(x + 1, y + 2, Item::Splitter, Dir::East).unwrap();
+            g.place(x + 3, y + 2, Item::Tunnel, Dir::East).unwrap();
+            g.place(x + 6, y + 2, Item::Tunnel, Dir::East).unwrap();
+            g.world.ensure_caches();
+            let s = render(&a, 120, 40);
+            let (inn, out) = if ascii { ('u', 'n') } else { ('∪', '∩') };
+            let arrow = Dir::East.arrow(ascii);
+            assert!(s.contains(&format!("Y{arrow}")), "{s}");
+            assert!(s.contains(&format!("{arrow}{inn}")), "{s}");
+            assert!(s.contains(&format!("{out}{arrow}")), "{s}");
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::game::Game;
 use crate::items::{Dir, EntityKind, Item};
 use crate::recipes::{Category, RecipeId, TechId};
 use crate::settings::{KeyMap, Settings};
-use crate::tools::{Blueprint, UndoStack, UndoStep, recipe_of, rect};
+use crate::tools::{Blueprint, UndoStack, UndoStep, filter_of, recipe_of, rect};
 use crate::world::State;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
@@ -22,6 +22,7 @@ pub enum EntitySub {
     Main,
     Insert,
     Recipe,
+    Filter,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -131,6 +132,8 @@ pub struct App {
     pub selected: Option<Item>,
     /// Recipe copied with `q` from a fabricator; new fabricators get it.
     pub selected_recipe: Option<RecipeId>,
+    /// Filter copied with `q` from a filter arm, applied to the ones built next.
+    pub selected_filter: Option<Item>,
     pub place_dir: Dir,
     pub paint: bool,
     pub paused: bool,
@@ -171,6 +174,7 @@ impl App {
             modal: Modal::None,
             selected: None,
             selected_recipe: None,
+            selected_filter: None,
             place_dir: Dir::East,
             paint: false,
             paused: false,
@@ -305,6 +309,7 @@ impl App {
         self.modal = Modal::None;
         self.selected = None;
         self.selected_recipe = None;
+        self.selected_filter = None;
         self.paint = false;
         self.paused = false;
         self.area_anchor = None;
@@ -631,14 +636,17 @@ impl App {
         let Some(kind) = item.building() else {
             return false;
         };
-        let recipe = self.selected_recipe;
+        let (recipe, filter) = (self.selected_recipe, self.selected_filter);
         let g = self.game.as_mut().unwrap();
         let existing = g.world.entity(x, y).map(|e| (e.kind, e.dir));
         match existing {
             None => match g.place(x, y, item, dir) {
-                Ok(()) => {
+                Ok(kind) => {
                     if kind == EntityKind::Fabricator && recipe.is_some() {
                         let _ = g.set_recipe(x, y, recipe);
+                    }
+                    if kind == EntityKind::FilterArm && filter.is_some() {
+                        let _ = g.set_filter(x, y, filter);
                     }
                     self.undo.push(UndoStep::Placed { x, y, kind });
                     true
@@ -650,9 +658,9 @@ impl App {
                     false
                 }
             },
-            Some((k, d)) if k == kind => {
-                if kind.is_belt() && d != dir {
-                    // Fast-replacing a belt with the same belt turns it.
+            Some((k, d)) if k.item() == item => {
+                if kind.is_transport() && d != dir {
+                    // Building a belt over the same belt turns it.
                     g.world.entity_mut(x, y).unwrap().dir = dir;
                     g.world.mark_dirty();
                     true
@@ -663,6 +671,7 @@ impl App {
             Some((k, _)) if k.family().is_some() && k.family() == kind.family() => {
                 match g.replace(x, y, item, dir) {
                     Ok(old) => {
+                        let kind = g.world.entity(x, y).map_or(kind, |e| e.kind);
                         if !quiet {
                             g.log(format!("Swapped {} for {}", old.kind.name(), kind.name()));
                         }
@@ -730,7 +739,7 @@ impl App {
             if self.paint
                 && let Some(item) = self.selected
             {
-                let is_belt = item.building().is_some_and(|k| k.is_belt());
+                let is_belt = item.building().is_some_and(|k| k.is_transport());
                 if is_belt {
                     self.place_dir = dir;
                     let g = self.game.as_mut().unwrap();
@@ -769,6 +778,7 @@ impl App {
     fn clear_tools(&mut self) {
         self.selected = None;
         self.selected_recipe = None;
+        self.selected_filter = None;
         self.blueprint = None;
         self.area_anchor = None;
         self.set_paint(false);
@@ -951,14 +961,15 @@ impl App {
                     self.clear_tools();
                 } else {
                     let (x, y) = self.cursor();
-                    if let Some((kind, dir, recipe)) = self
+                    if let Some((kind, dir, recipe, filter)) = self
                         .game()
                         .world
                         .entity(x, y)
-                        .map(|e| (e.kind, e.dir, recipe_of(&e.state)))
+                        .map(|e| (e.kind, e.dir, recipe_of(&e.state), filter_of(&e.state)))
                     {
                         self.selected = Some(kind.item());
                         self.selected_recipe = recipe;
+                        self.selected_filter = filter;
                         if kind.directional() {
                             self.place_dir = dir;
                         }
@@ -1057,6 +1068,7 @@ impl App {
         let item = self.game().player.hotbar[slot];
         self.blueprint = None;
         self.selected_recipe = None;
+        self.selected_filter = None;
         if self.selected == item {
             self.selected = None;
             self.set_paint(false);
@@ -1324,7 +1336,9 @@ impl App {
     }
 
     fn build_key(&mut self, k: KeyEvent, sel: usize) {
-        let n = EntityKind::ALL.len();
+        let kinds: Vec<EntityKind> = EntityKind::menu().collect();
+        let n = kinds.len();
+        let sel = sel.min(n - 1);
         match k.code {
             KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
                 self.modal = Modal::Build {
@@ -1335,7 +1349,9 @@ impl App {
                 self.modal = Modal::Build { sel: (sel + 1) % n }
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                self.selected = Some(EntityKind::ALL[sel].item());
+                self.selected = Some(kinds[sel].item());
+                self.selected_recipe = None;
+                self.selected_filter = None;
                 self.modal = Modal::None;
             }
             KeyCode::Char(c @ '0'..='9') => {
@@ -1344,7 +1360,7 @@ impl App {
                 } else {
                     c as usize - '1' as usize
                 };
-                let item = EntityKind::ALL[sel].item();
+                let item = kinds[sel].item();
                 let g = self.game();
                 g.player.hotbar[slot] = Some(item);
                 g.log(format!("{} assigned to hotbar slot {c}", item.name()));
@@ -1444,6 +1460,17 @@ impl App {
                     self.game().log(format!("Took {n} items"));
                 }
                 KeyCode::Char('i') => self.modal = set(EntitySub::Insert, 0),
+                KeyCode::Char('f') if kind == EntityKind::FilterArm => {
+                    let cur = filter_of(&self.game().world.entity(x, y).unwrap().state);
+                    let pos = filter_choices().iter().position(|c| *c == cur).unwrap_or(0);
+                    self.modal = set(EntitySub::Filter, pos);
+                }
+                KeyCode::Char('v') if kind.is_tunnel() => {
+                    let g = self.game();
+                    g.world.flip_tunnel(x, y);
+                    let now = g.world.entity(x, y).map_or(kind, |e| e.kind);
+                    g.log(format!("Now a {}", now.name().to_lowercase()));
+                }
                 KeyCode::Char('f') => {
                     let n = self.game().insert(x, y, Item::Lignite, 50);
                     if n > 0 {
@@ -1529,6 +1556,31 @@ impl App {
                     _ => {}
                 }
             }
+            EntitySub::Filter => {
+                let list = filter_choices();
+                let n = list.len();
+                match k.code {
+                    KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
+                        self.modal = set(sub, (sel + n - 1) % n)
+                    }
+                    KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('j') => {
+                        self.modal = set(sub, (sel + 1) % n)
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        let f = list[sel.min(n - 1)];
+                        match self.game().set_filter(x, y, f) {
+                            Ok(()) => {
+                                let what = f.map_or("anything", |i| i.name());
+                                self.game().log(format!("Filter arm now moves {what}"));
+                            }
+                            Err(e) => self.game().log(e),
+                        }
+                        self.modal = set(EntitySub::Main, 0);
+                    }
+                    c if is_close(c, &['f']) => self.modal = set(EntitySub::Main, 0),
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1565,6 +1617,13 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// What a filter arm can be set to: anything (`None`), then every item.
+pub fn filter_choices() -> Vec<Option<Item>> {
+    std::iter::once(None)
+        .chain(Item::ALL.into_iter().map(Some))
+        .collect()
 }
 
 fn plain_key(code: KeyCode) -> KeyEvent {
@@ -1819,7 +1878,7 @@ mod tests {
         let e = g.world.entity(5, 5).unwrap();
         assert_eq!(e.kind, EntityKind::ExpressConveyor);
         // The cog stays on the belt and the old conveyor comes back.
-        assert!(matches!(&e.state, State::Belt { items } if items.len() == 1));
+        assert!(matches!(&e.state, State::Belt { items, .. } if items.len() == 1));
         assert_eq!(g.player.inventory.count(Item::Conveyor), belts + 1);
         // Undo puts the old conveyor back.
         a.handle_key(key(KeyCode::Char('u')));

@@ -206,27 +206,55 @@ impl Game {
 
     // ---- Building ----
 
-    pub fn place(&mut self, x: i32, y: i32, item: Item, dir: Dir) -> Result<(), String> {
+    /// What `item` becomes when built at (x, y). A tunnel belt turns into an exit when it
+    /// completes an entrance waiting behind it, and an entrance otherwise.
+    fn kind_for(&mut self, x: i32, y: i32, item: Item, dir: Dir) -> Result<EntityKind, String> {
         let kind = item
             .building()
             .ok_or_else(|| format!("{} can't be placed", item.name()))?;
+        if kind == EntityKind::TunnelIn && self.world.tunnel_wants_exit(x, y, dir) {
+            return Ok(EntityKind::TunnelOut);
+        }
+        Ok(kind)
+    }
+
+    /// Builds `item` from the inventory at (x, y). Returns what was built.
+    pub fn place(&mut self, x: i32, y: i32, item: Item, dir: Dir) -> Result<EntityKind, String> {
+        let kind = self.kind_for(x, y, item, dir)?;
+        self.place_kind(x, y, kind, dir)?;
+        if kind == EntityKind::TunnelIn {
+            self.world.tunnel_adopt_ahead(x, y, dir);
+        }
+        Ok(kind)
+    }
+
+    /// Builds exactly `kind` (blueprints and undo, which must not re-decide tunnel ends).
+    pub fn place_kind(
+        &mut self,
+        x: i32,
+        y: i32,
+        kind: EntityKind,
+        dir: Dir,
+    ) -> Result<EntityKind, String> {
+        let item = kind.item();
         if self.player.inventory.count(item) == 0 {
             return Err(format!("No {} in inventory", item.name()));
         }
         self.world.place(x, y, kind, dir)?;
         self.player.inventory.remove(item, 1);
-        Ok(())
+        Ok(kind)
     }
 
     /// Swaps the building at (x, y) for `item` from the same family (conveyor → express, kiln →
     /// arc furnace, ...). The old building and its contents go back to the inventory; belt items stay
     /// on the belt. Returns the old entity.
     pub fn replace(&mut self, x: i32, y: i32, item: Item, dir: Dir) -> Result<Entity, String> {
-        let kind = item
-            .building()
-            .ok_or_else(|| format!("{} can't be placed", item.name()))?;
+        let kind = self.kind_for(x, y, item, dir)?;
         let old = self.world.entity(x, y).ok_or("Nothing to replace here")?;
-        if old.kind == kind || old.kind.family().is_none() || old.kind.family() != kind.family() {
+        if old.kind.item() == item
+            || old.kind.family().is_none()
+            || old.kind.family() != kind.family()
+        {
             return Err(format!(
                 "Can't put a {} over a {}",
                 kind.name(),
@@ -237,7 +265,7 @@ impl Game {
             return Err(format!("No {} in inventory", item.name()));
         }
         let old = self.world.remove(x, y).expect("checked above");
-        let dir = if kind.is_belt() { dir } else { old.dir };
+        let dir = if kind.is_transport() { dir } else { old.dir };
         self.world
             .place(x, y, kind, dir)
             .expect("the tile was just cleared");
@@ -247,10 +275,37 @@ impl Game {
             &old.state,
             self.world.entity_mut(x, y).map(|e| &mut e.state),
         ) {
-            (State::Belt { items }, Some(State::Belt { items: new })) => *new = items.clone(),
+            (State::Belt { items, .. }, Some(State::Belt { items: new, .. })) => {
+                *new = items.clone()
+            }
+            (
+                State::Arm { hand, filter, .. },
+                Some(State::Arm {
+                    hand: new_hand,
+                    filter: new_filter,
+                    ..
+                }),
+            ) => {
+                *new_hand = *hand;
+                if kind == EntityKind::FilterArm {
+                    *new_filter = *filter;
+                }
+            }
             _ => old.contents().drain_into(&mut self.player.inventory),
         }
         Ok(old)
+    }
+
+    /// Sets what a filter arm moves. `None` lets it move anything.
+    pub fn set_filter(&mut self, x: i32, y: i32, item: Option<Item>) -> Result<(), String> {
+        let e = self.world.entity_mut(x, y).ok_or("No building here")?;
+        match &mut e.state {
+            State::Arm { filter, .. } if e.kind == EntityKind::FilterArm => {
+                *filter = item;
+                Ok(())
+            }
+            _ => Err("Only filter arms take a filter".into()),
+        }
     }
 
     /// Buildings that currently report a problem, in map order.
@@ -285,7 +340,7 @@ impl Game {
         };
         let mut got = Inventory::new();
         match &mut e.state {
-            State::Belt { items } => {
+            State::Belt { items, .. } => {
                 for b in items.drain(..) {
                     got.add(b.item, 1);
                 }
@@ -831,5 +886,71 @@ mod tests {
         run(&mut g, NOTICE_SECS as u32 + 1);
         g.log("Picked up Crate");
         assert_eq!(g.status_message().unwrap().text, "Picked up Crate");
+    }
+
+    #[test]
+    fn tunnel_pieces_pick_their_end_when_placed() {
+        let mut g = game();
+        g.player.inventory.add(Item::Tunnel, 6);
+        // Built in the usual order: entrance first, then the exit ahead.
+        assert_eq!(
+            g.place(2, 2, Item::Tunnel, Dir::East),
+            Ok(EntityKind::TunnelIn)
+        );
+        assert_eq!(
+            g.place(5, 2, Item::Tunnel, Dir::East),
+            Ok(EntityKind::TunnelOut)
+        );
+        // That pair is complete, so the next piece starts a new tunnel.
+        assert_eq!(
+            g.place(7, 2, Item::Tunnel, Dir::East),
+            Ok(EntityKind::TunnelIn)
+        );
+        // Built backwards: the far end goes down first and becomes the exit afterwards.
+        g.place(9, 6, Item::Tunnel, Dir::West).unwrap();
+        assert_eq!(
+            g.place(12, 6, Item::Tunnel, Dir::West),
+            Ok(EntityKind::TunnelIn)
+        );
+        assert_eq!(g.world.entity(9, 6).unwrap().kind, EntityKind::TunnelOut);
+        g.world.ensure_caches();
+        let i = g.world.idx(12, 6).unwrap();
+        assert_eq!(g.world.tunnel_pair(i), g.world.idx(9, 6));
+        // Flipping turns an end around by hand.
+        assert!(g.world.flip_tunnel(7, 2));
+        assert_eq!(g.world.entity(7, 2).unwrap().kind, EntityKind::TunnelOut);
+        // Both ends give back the same item.
+        g.remove(5, 2).unwrap();
+        g.remove(2, 2).unwrap();
+        assert_eq!(g.player.inventory.count(Item::Tunnel), 3);
+    }
+
+    #[test]
+    fn swapping_arms_keeps_what_they_hold() {
+        let mut g = game();
+        g.player.inventory.add(Item::FilterArm, 1);
+        g.player.inventory.add(Item::Arm, 1);
+        g.place(4, 4, Item::FilterArm, Dir::East).unwrap();
+        g.set_filter(4, 4, Some(Item::Coil)).unwrap();
+        assert!(g.set_filter(5, 5, Some(Item::Coil)).is_err());
+        if let State::Arm { hand, .. } = &mut g.world.entity_mut(4, 4).unwrap().state {
+            *hand = Some(Item::Coil);
+        }
+        let old = g.replace(4, 4, Item::Arm, Dir::North).unwrap();
+        assert_eq!(old.kind, EntityKind::FilterArm);
+        let e = g.world.entity(4, 4).unwrap();
+        assert_eq!(e.kind, EntityKind::Arm);
+        // Arms keep facing the way they did, and the held item isn't duplicated.
+        assert_eq!(e.dir, Dir::East);
+        assert!(matches!(
+            e.state,
+            State::Arm {
+                hand: Some(Item::Coil),
+                filter: None,
+                ..
+            }
+        ));
+        assert_eq!(g.player.inventory.count(Item::Coil), 0);
+        assert_eq!(g.player.inventory.count(Item::FilterArm), 1);
     }
 }

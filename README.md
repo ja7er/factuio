@@ -80,8 +80,12 @@ advertises it through `COLORTERM`; otherwise they fall back to the 256-colour pa
 area when nothing is selected), right click or drag picks up, the wheel scrolls, and the hotbar
 is clickable.
 
-**Upgrading in place:** placing an express conveyor, swift arm, electric bore or arc furnace over
-its basic version swaps it, and the old one goes back to your inventory.
+**Upgrading in place:** placing an express conveyor, swift or filter arm, electric bore or arc
+furnace over its basic version swaps it, and the old one goes back to your inventory.
+
+**Tunnels:** place a tunnel belt, then a second one up to five tiles further along facing the same
+way. The second becomes the exit and items travel underground between them, past buildings and
+crossing belts. Inspect either end (`e`) and press `v` to swap entrance and exit by hand.
 
 **Blueprints:** copy an area with `z` … `y`, then `Enter` places it at the cursor, `r` rotates
 it and `Esc` drops it.
@@ -134,7 +138,11 @@ processor + motor + steel ─▶ relay module ─▶ Uplink array ★
 | `K` | Kiln | Burns lignite to smelt |
 | `E` | Arc furnace | Electric, twice as fast (Arc smelting) |
 | `→→` | Conveyor / express conveyor | Items ride on it, shown by their letter; side-loading works |
+| `Y→` | Splitter | Shares items in turn between the belts ahead, left and right; skips any that are full (Belt routing) |
+| `→∪` `∩→` | Tunnel belt | Entrance and exit, up to 4 tiles apart underground (Belt routing) |
 | `ɑ→` | Arm / swift arm | Grabs from behind, drops ahead; only picks what the target can use |
+| `ɑ→` | Long arm | Orange. Reaches two tiles each way, over whatever is in between (Logistics) |
+| `ɑ→` | Filter arm | Purple. A swift arm that moves only the item you pick with `e` then `f` (Sorting) |
 | `C` | Crate | Stores 800 items |
 | `G` | Generator | Burns lignite for 900 kW |
 | `P` | Pylon | Powers a 5×5 area and links to pylons up to 7 tiles away |
@@ -146,7 +154,7 @@ processor + motor + steel ─▶ relay module ─▶ Uplink array ★
 **Power.** Each pylon network sums its generators and panels. When demand exceeds
 supply every machine on that network slows down proportionally.
 
-**Research.** Twelve technologies use Alpha, Beta and Gamma datapacks. Pick one
+**Research.** Fourteen technologies use Alpha, Beta and Gamma datapacks. Pick one
 with `t`, then keep your labs supplied.
 
 The sidebar always shows a **Goal** line telling you what to do next.

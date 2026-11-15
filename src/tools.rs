@@ -1,7 +1,7 @@
 //! Player tools that work on many buildings at once: area selection, blueprints and undo.
 
 use crate::game::Game;
-use crate::items::{Dir, EntityKind};
+use crate::items::{Dir, EntityKind, Item};
 use crate::recipes::RecipeId;
 use crate::world::State;
 
@@ -13,6 +13,7 @@ pub struct BpCell {
     pub kind: EntityKind,
     pub dir: Dir,
     pub recipe: Option<RecipeId>,
+    pub filter: Option<Item>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +35,34 @@ pub fn recipe_of(state: &State) -> Option<RecipeId> {
     }
 }
 
+pub fn filter_of(state: &State) -> Option<Item> {
+    match state {
+        State::Arm { filter, .. } => *filter,
+        _ => None,
+    }
+}
+
+/// Builds `kind` and restores its settings. Shared by blueprint paste and undo.
+fn rebuild(
+    game: &mut Game,
+    (x, y): (i32, i32),
+    kind: EntityKind,
+    dir: Dir,
+    recipe: Option<RecipeId>,
+    filter: Option<Item>,
+) -> bool {
+    if game.place_kind(x, y, kind, dir).is_err() {
+        return false;
+    }
+    if recipe.is_some() {
+        let _ = game.set_recipe(x, y, recipe);
+    }
+    if filter.is_some() {
+        let _ = game.set_filter(x, y, filter);
+    }
+    true
+}
+
 impl Blueprint {
     /// Copies the buildings in the rectangle between two corners. `None` if it holds none.
     pub fn copy(game: &Game, a: (i32, i32), b: (i32, i32)) -> Option<Blueprint> {
@@ -48,6 +77,7 @@ impl Blueprint {
                         kind: e.kind,
                         dir: e.dir,
                         recipe: recipe_of(&e.state),
+                        filter: filter_of(&e.state),
                     });
                 }
             }
@@ -94,10 +124,7 @@ impl Blueprint {
             if game.world.entity(px, py).is_some_and(|e| e.kind == c.kind) {
                 continue;
             }
-            if game.place(px, py, c.kind.item(), c.dir).is_ok() {
-                if c.recipe.is_some() {
-                    let _ = game.set_recipe(px, py, c.recipe);
-                }
+            if rebuild(game, (px, py), c.kind, c.dir, c.recipe, c.filter) {
                 steps.push(UndoStep::Placed {
                     x: px,
                     y: py,
@@ -127,6 +154,7 @@ pub enum UndoStep {
         kind: EntityKind,
         dir: Dir,
         recipe: Option<RecipeId>,
+        filter: Option<Item>,
     },
 }
 
@@ -138,6 +166,7 @@ impl UndoStep {
             kind: e.kind,
             dir: e.dir,
             recipe: recipe_of(&e.state),
+            filter: filter_of(&e.state),
         }
     }
 
@@ -157,15 +186,10 @@ impl UndoStep {
                 kind,
                 dir,
                 recipe,
+                filter,
             } => {
-                if game.world.entity(x, y).is_some() || game.place(x, y, kind.item(), dir).is_err()
-                {
-                    return false;
-                }
-                if recipe.is_some() {
-                    let _ = game.set_recipe(x, y, recipe);
-                }
-                true
+                game.world.entity(x, y).is_none()
+                    && rebuild(game, (x, y), kind, dir, recipe, filter)
             }
         }
     }
@@ -241,7 +265,6 @@ impl UndoStack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::items::Item;
     use crate::world::World;
 
     fn game() -> Game {
@@ -290,6 +313,42 @@ mod tests {
         assert_eq!(
             recipe_of(&g.world.entity(5, 5).unwrap().state),
             RecipeId::by_id("cog")
+        );
+    }
+
+    #[test]
+    fn blueprints_and_undo_keep_filters_and_tunnel_ends() {
+        let mut g = game();
+        g.player.inventory.add(Item::Tunnel, 4);
+        g.player.inventory.add(Item::FilterArm, 2);
+        g.place(2, 2, Item::Tunnel, Dir::East).unwrap();
+        g.place(5, 2, Item::Tunnel, Dir::East).unwrap();
+        g.place(3, 4, Item::FilterArm, Dir::South).unwrap();
+        g.set_filter(3, 4, Some(Item::Glass)).unwrap();
+        let bp = Blueprint::copy(&g, (2, 2), (5, 4)).unwrap();
+        let (placed, skipped, _) = bp.paste(&mut g, 2, 10);
+        assert_eq!((placed, skipped), (3, 0));
+        // The copy keeps which end is which, even pasted somewhere a fresh piece would guess.
+        assert_eq!(g.world.entity(2, 10).unwrap().kind, EntityKind::TunnelIn);
+        assert_eq!(g.world.entity(5, 10).unwrap().kind, EntityKind::TunnelOut);
+        assert_eq!(
+            filter_of(&g.world.entity(3, 12).unwrap().state),
+            Some(Item::Glass)
+        );
+        // Undoing a pick-up brings the exit back as an exit, with its filter arm neighbour.
+        let steps: Vec<UndoStep> = [(5, 2), (3, 4)]
+            .iter()
+            .map(|&(x, y)| UndoStep::removed(x, y, g.world.entity(x, y).unwrap()))
+            .collect();
+        g.remove(5, 2).unwrap();
+        g.remove(3, 4).unwrap();
+        for s in steps.iter().rev() {
+            assert!(s.undo(&mut g));
+        }
+        assert_eq!(g.world.entity(5, 2).unwrap().kind, EntityKind::TunnelOut);
+        assert_eq!(
+            filter_of(&g.world.entity(3, 4).unwrap().state),
+            Some(Item::Glass)
         );
     }
 

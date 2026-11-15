@@ -18,7 +18,13 @@ pub const PYLON_SUPPLY: i32 = 2;
 pub const PYLON_REACH_SQ: i32 = 56;
 pub const CRATE_CAP: u32 = 800;
 pub const UPLINK_GOAL: u32 = 20;
+/// Furthest a tunnel exit can be from its entrance, in tiles (so it passes under up to 4).
+pub const TUNNEL_REACH: i32 = 5;
 const NO_NET: u16 = u16::MAX;
+const NO_PAIR: u32 = u32::MAX;
+
+/// Up to three (tile, position) places a transport tile hands items to, and how many there are.
+type Outputs = ([(usize, u8); 3], usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Terrain {
@@ -47,6 +53,8 @@ pub enum Status {
     NoRecipe,
     Depleted,
     NoResearch,
+    /// A tunnel entrance or exit without its other end.
+    Unlinked,
     Done,
 }
 
@@ -63,6 +71,7 @@ impl Status {
             Status::NoRecipe => "no recipe set",
             Status::Depleted => "no ore left",
             Status::NoResearch => "no research selected",
+            Status::Unlinked => "no other end in reach",
             Status::Done => "complete",
         }
     }
@@ -76,6 +85,7 @@ impl Status {
                 | Status::NoRecipe
                 | Status::Depleted
                 | Status::NoResearch
+                | Status::Unlinked
         )
     }
 }
@@ -130,15 +140,27 @@ pub enum ArmPhase {
     Return,
 }
 
+fn is_zero(n: &u8) -> bool {
+    *n == 0
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum State {
+    /// Conveyors, splitters and tunnel belts. Items are sorted by `pos`, furthest along last.
+    /// A tunnel entrance also holds the items travelling underground, at `pos` beyond `TILE_LEN`.
     Belt {
         items: Vec<BeltItem>,
+        /// Which output a splitter tries next.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        turn: u8,
     },
     Arm {
         hand: Option<Item>,
         phase: ArmPhase,
         t: f32,
+        /// Filter arms only move this item.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<Item>,
     },
     Miner {
         fuel: Fuel,
@@ -194,11 +216,22 @@ pub struct Entity {
 impl Entity {
     pub fn new(kind: EntityKind, dir: Dir) -> Self {
         let state = match kind {
-            EntityKind::Conveyor | EntityKind::ExpressConveyor => State::Belt { items: vec![] },
-            EntityKind::Arm | EntityKind::SwiftArm => State::Arm {
+            EntityKind::Conveyor
+            | EntityKind::ExpressConveyor
+            | EntityKind::Splitter
+            | EntityKind::TunnelIn
+            | EntityKind::TunnelOut => State::Belt {
+                items: vec![],
+                turn: 0,
+            },
+            EntityKind::Arm
+            | EntityKind::SwiftArm
+            | EntityKind::LongArm
+            | EntityKind::FilterArm => State::Arm {
                 hand: None,
                 phase: ArmPhase::Pickup,
                 t: 0.0,
+                filter: None,
             },
             EntityKind::Digger | EntityKind::Bore => State::Miner {
                 fuel: Fuel::default(),
@@ -251,7 +284,7 @@ impl Entity {
     pub fn contents(&self) -> Inventory {
         let mut inv = Inventory::new();
         match &self.state {
-            State::Belt { items } => {
+            State::Belt { items, .. } => {
                 for b in items {
                     inv.add(b.item, 1);
                 }
@@ -435,6 +468,8 @@ pub struct World {
     power_sources: Vec<usize>,
     power_net: Vec<u16>,
     pub nets: Vec<Net>,
+    /// For each tunnel piece, the index of its other end (`NO_PAIR` if none).
+    pair: Vec<u32>,
 }
 
 pub const ORES: [Item; 4] = [
@@ -473,6 +508,7 @@ impl World {
             power_sources: vec![],
             power_net: vec![NO_NET; n],
             nets: vec![],
+            pair: vec![NO_PAIR; n],
         }
     }
 
@@ -687,11 +723,123 @@ impl World {
         }
     }
 
-    fn belt_next(&self, i: usize) -> Option<usize> {
-        let e = self.entities[i].as_ref()?;
-        let j = self.neighbor(i, e.dir)?;
+    /// Where an item leaving tile `i` in direction `o` would land: the tile and the position
+    /// on it. `None` if nothing there takes items from that side.
+    fn link(&self, i: usize, o: Dir) -> Option<(usize, u8)> {
+        let j = self.neighbor(i, o)?;
         let n = self.entities[j].as_ref()?;
-        (n.kind.is_belt() && n.dir != e.dir.opposite()).then_some(j)
+        if !n.kind.is_transport() || n.dir == o.opposite() {
+            return None;
+        }
+        // The back of a tunnel exit is underground.
+        if n.kind == EntityKind::TunnelOut && n.dir == o {
+            return None;
+        }
+        Some((j, if n.dir == o { 0 } else { TILE_LEN / 2 }))
+    }
+
+    /// The tiles a transport building at `i` can pass items on to, in the order a splitter
+    /// takes turns between them.
+    fn outputs(&self, i: usize, kind: EntityKind, dir: Dir) -> Outputs {
+        let mut out = [(0, 0); 3];
+        let mut n = 0;
+        let mut push = |l: Option<(usize, u8)>| {
+            if let Some(l) = l {
+                out[n] = l;
+                n += 1;
+            }
+        };
+        match kind {
+            EntityKind::TunnelIn => push(self.tunnel_pair(i).map(|j| (j, 0))),
+            EntityKind::Splitter => {
+                for o in [dir, dir.ccw(), dir.cw()] {
+                    push(self.link(i, o));
+                }
+            }
+            _ => push(self.link(i, dir)),
+        }
+        (out, n)
+    }
+
+    /// The other end of the tunnel piece at `i`, if it has one.
+    pub fn tunnel_pair(&self, i: usize) -> Option<usize> {
+        match self.pair.get(i) {
+            Some(&p) if p != NO_PAIR => Some(p as usize),
+            _ => None,
+        }
+    }
+
+    /// Length of the belt at `i` in sub-tile units. A linked tunnel entrance includes the
+    /// stretch underground.
+    fn belt_len(&self, i: usize, kind: EntityKind) -> u8 {
+        if kind == EntityKind::TunnelIn
+            && let Some(j) = self.tunnel_pair(i)
+        {
+            let (ax, ay) = self.pos(i);
+            let (bx, by) = self.pos(j);
+            return TILE_LEN * ((ax - bx).abs() + (ay - by).abs()) as u8;
+        }
+        TILE_LEN
+    }
+
+    /// The entrance a tunnel piece placed at (x, y) facing `dir` would complete: the nearest
+    /// tunnel piece behind it within reach, if that is an entrance still waiting for an exit.
+    /// Links must be current (`ensure_caches`).
+    pub fn tunnel_entrance_behind(&self, x: i32, y: i32, dir: Dir) -> Option<usize> {
+        let (dx, dy) = dir.delta();
+        for k in 1..=TUNNEL_REACH {
+            let j = self.idx(x - dx * k, y - dy * k)?;
+            if let Some(e) = self.entities[j].as_ref()
+                && e.kind.is_tunnel()
+                && e.dir == dir
+            {
+                return (e.kind == EntityKind::TunnelIn && self.pair[j] == NO_PAIR).then_some(j);
+            }
+        }
+        None
+    }
+
+    /// Whether a tunnel piece placed at (x, y) facing `dir` should be an exit.
+    pub fn tunnel_wants_exit(&mut self, x: i32, y: i32, dir: Dir) -> bool {
+        self.ensure_caches();
+        self.tunnel_entrance_behind(x, y, dir).is_some()
+    }
+
+    /// After an entrance goes in at (x, y): if the nearest tunnel piece ahead is another
+    /// entrance with no exit, it becomes this one's exit. That makes building a tunnel from
+    /// the far end backwards work too.
+    pub fn tunnel_adopt_ahead(&mut self, x: i32, y: i32, dir: Dir) {
+        self.ensure_caches();
+        let (dx, dy) = dir.delta();
+        for k in 1..=TUNNEL_REACH {
+            let Some(j) = self.idx(x + dx * k, y + dy * k) else {
+                return;
+            };
+            if let Some(e) = self.entities[j].as_mut()
+                && e.kind.is_tunnel()
+                && e.dir == dir
+            {
+                if e.kind == EntityKind::TunnelIn && self.pair[j] == NO_PAIR {
+                    e.kind = EntityKind::TunnelOut;
+                    self.dirty = true;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Turns a tunnel entrance into an exit or back.
+    pub fn flip_tunnel(&mut self, x: i32, y: i32) -> bool {
+        let Some(e) = self.entity_mut(x, y) else {
+            return false;
+        };
+        e.kind = match e.kind {
+            EntityKind::TunnelIn => EntityKind::TunnelOut,
+            EntityKind::TunnelOut => EntityKind::TunnelIn,
+            _ => return false,
+        };
+        self.dirty = true;
+        true
     }
 
     fn rebuild(&mut self) {
@@ -702,7 +850,7 @@ impl World {
         let mut pylons = vec![];
         for (i, e) in self.entities.iter().enumerate() {
             let Some(e) = e else { continue };
-            if e.kind.is_belt() {
+            if e.kind.is_transport() {
                 belts.push(i);
             } else if e.kind == EntityKind::Pylon {
                 pylons.push(i);
@@ -713,34 +861,68 @@ impl World {
             }
         }
 
-        // Order belts so the ones nearest the end of a line update first.
-        let mut depth: Vec<i32> = vec![-1; self.entities.len()];
-        for &b in &belts {
-            if depth[b] >= 0 {
+        // Link each tunnel entrance to the first free exit ahead of it, facing the same way.
+        self.pair.iter_mut().for_each(|p| *p = NO_PAIR);
+        for &i in &belts {
+            let e = self.entities[i].as_ref().unwrap();
+            if e.kind != EntityKind::TunnelIn {
                 continue;
             }
-            let mut path = vec![];
-            let mut cur = Some(b);
-            let mut base = 0;
-            while let Some(c) = cur {
-                if depth[c] >= 0 {
-                    base = depth[c] + 1;
+            let dir = e.dir;
+            let mut cur = i;
+            for _ in 0..TUNNEL_REACH {
+                let Some(j) = self.neighbor(cur, dir) else {
+                    break;
+                };
+                cur = j;
+                if let Some(n) = self.entities[j].as_ref()
+                    && n.kind.is_tunnel()
+                    && n.dir == dir
+                {
+                    if n.kind == EntityKind::TunnelOut && self.pair[j] == NO_PAIR {
+                        self.pair[i] = j as u32;
+                        self.pair[j] = i as u32;
+                    }
                     break;
                 }
-                if depth[c] == -2 {
-                    // Loop: break it here.
-                    break;
-                }
-                depth[c] = -2;
-                path.push(c);
-                cur = self.belt_next(c);
-            }
-            for (k, &p) in path.iter().rev().enumerate() {
-                depth[p] = base + k as i32;
             }
         }
-        belts.sort_by_key(|&b| (depth[b], b));
-        self.belt_order = belts;
+
+        // Order transport tiles so each one updates after everything it feeds: the end of a
+        // line moves first and frees room for what's behind it. Depth-first, post-order;
+        // loops are cut wherever the walk meets itself.
+        const NEW: u8 = 0;
+        const OPEN: u8 = 1;
+        const DONE: u8 = 2;
+        let mut mark = vec![NEW; self.entities.len()];
+        let mut order = Vec::with_capacity(belts.len());
+        // (tile, its outputs, next output to visit)
+        let mut stack: Vec<(usize, Outputs, usize)> = vec![];
+        for &b in &belts {
+            if mark[b] != NEW {
+                continue;
+            }
+            let e = self.entities[b].as_ref().unwrap();
+            mark[b] = OPEN;
+            stack.push((b, self.outputs(b, e.kind, e.dir), 0));
+            while let Some(top) = stack.last_mut() {
+                let ((outs, n), k) = (top.1, top.2);
+                if k < n {
+                    let next = outs[k].0;
+                    top.2 += 1;
+                    if mark[next] == NEW {
+                        let e = self.entities[next].as_ref().unwrap();
+                        mark[next] = OPEN;
+                        stack.push((next, self.outputs(next, e.kind, e.dir), 0));
+                    }
+                } else {
+                    mark[top.0] = DONE;
+                    order.push(top.0);
+                    stack.pop();
+                }
+            }
+        }
+        self.belt_order = order;
 
         // Power networks: union-find over pylons.
         let mut parent: Vec<usize> = (0..pylons.len()).collect();
@@ -936,47 +1118,51 @@ impl World {
         let Some(mut e) = self.entities[i].take() else {
             return;
         };
-        let speed = e.kind.belt_speed();
-        let dir = e.dir;
-        let next = self.belt_next_with(i, dir);
-        if let State::Belt { items } = &mut e.state {
+        let (kind, dir) = (e.kind, e.dir);
+        let speed = kind.belt_speed();
+        let len = self.belt_len(i, kind);
+        if let State::Belt { items, turn } = &mut e.state {
             let n = items.len();
             for k in (0..n).rev() {
                 let limit = if k + 1 < n {
                     items[k + 1].pos.saturating_sub(SPACING)
                 } else {
-                    TILE_LEN
+                    len
                 };
                 let p = items[k].pos;
                 items[k].pos = (p + speed).min(limit).max(p);
             }
             if let Some(front) = items.last()
-                && front.pos >= TILE_LEN
-                && let Some(j) = next
-                && let Some(Entity {
-                    state: State::Belt { items: nitems },
-                    dir: ndir,
-                    ..
-                }) = self.entities[j].as_mut()
+                && front.pos >= len
             {
-                let pos = if *ndir == dir { 0 } else { TILE_LEN / 2 };
-                if Self::belt_insert(nitems, front.item, pos) {
-                    items.pop();
+                // Hand the front item on. A splitter starts with whichever output is next in
+                // turn and falls through to the others if that one is full.
+                let item = front.item;
+                let (outs, n) = self.outputs(i, kind, dir);
+                for k in 0..n {
+                    let pick = (*turn as usize + k) % n;
+                    let (j, pos) = outs[pick];
+                    if let Some(Entity {
+                        state: State::Belt { items: nitems, .. },
+                        ..
+                    }) = self.entities[j].as_mut()
+                        && Self::belt_insert(nitems, item, pos)
+                    {
+                        items.pop();
+                        *turn = ((pick + 1) % n) as u8;
+                        break;
+                    }
                 }
             }
-            e.status = if items.is_empty() {
+            e.status = if kind.is_tunnel() && self.tunnel_pair(i).is_none() {
+                Status::Unlinked
+            } else if items.is_empty() {
                 Status::Idle
             } else {
                 Status::Working
             };
         }
         self.entities[i] = Some(e);
-    }
-
-    fn belt_next_with(&self, i: usize, dir: Dir) -> Option<usize> {
-        let j = self.neighbor(i, dir)?;
-        let n = self.entities[j].as_ref()?;
-        (n.kind.is_belt() && n.dir != dir.opposite()).then_some(j)
     }
 
     /// How many of `item` the entity at `i` will accept. `manual` is a player insert (bigger buffers).
@@ -993,7 +1179,7 @@ impl World {
             }
         };
         match &e.state {
-            State::Belt { items } => {
+            State::Belt { items, .. } => {
                 if !manual && Self::belt_room(items, TILE_LEN / 2) {
                     1
                 } else {
@@ -1070,7 +1256,7 @@ impl World {
             return 0;
         };
         match &mut e.state {
-            State::Belt { items } => {
+            State::Belt { items, .. } => {
                 if Self::belt_insert(items, item, TILE_LEN / 2) {
                     1
                 } else {
@@ -1107,9 +1293,10 @@ impl World {
             return vec![];
         };
         match &e.state {
-            State::Belt { items } => {
+            State::Belt { items, .. } => {
+                // Only what's on the surface: a tunnel entrance also holds items underground.
                 let mut v: Vec<Item> = vec![];
-                for b in items.iter().rev() {
+                for b in items.iter().rev().filter(|b| b.pos <= TILE_LEN) {
                     if !v.contains(&b.item) {
                         v.push(b.item);
                     }
@@ -1128,8 +1315,11 @@ impl World {
             return false;
         };
         match &mut e.state {
-            State::Belt { items } => {
-                if let Some(k) = items.iter().rposition(|b| b.item == item) {
+            State::Belt { items, .. } => {
+                if let Some(k) = items
+                    .iter()
+                    .rposition(|b| b.item == item && b.pos <= TILE_LEN)
+                {
                     items.remove(k);
                     true
                 } else {
@@ -1148,7 +1338,7 @@ impl World {
             return;
         };
         match e.kind {
-            EntityKind::Arm | EntityKind::SwiftArm => self.update_arm(i, &mut e),
+            k if k.is_arm() => self.update_arm(i, &mut e),
             EntityKind::Digger | EntityKind::Bore => self.update_miner(i, &mut e),
             EntityKind::Kiln | EntityKind::ArcFurnace => self.update_furnace(i, &mut e),
             EntityKind::Fabricator => self.update_assembler(i, &mut e),
@@ -1176,14 +1366,31 @@ impl World {
         sat
     }
 
+    /// The tiles an arm at `i` facing `dir` takes from and drops to.
+    pub fn arm_ends(&self, i: usize, kind: EntityKind, dir: Dir) -> (Option<usize>, Option<usize>) {
+        let (x, y) = self.pos(i);
+        let (dx, dy) = dir.delta();
+        let n = kind.arm_reach();
+        (
+            self.idx(x - dx * n, y - dy * n),
+            self.idx(x + dx * n, y + dy * n),
+        )
+    }
+
     fn update_arm(&mut self, i: usize, e: &mut Entity) {
-        let back = self.neighbor(i, e.dir.opposite());
-        let front = self.neighbor(i, e.dir);
         let kind = e.kind;
+        let (back, front) = self.arm_ends(i, kind, e.dir);
         let mut status = Status::Idle;
-        let State::Arm { hand, phase, t } = &mut e.state else {
+        let State::Arm {
+            hand,
+            phase,
+            t,
+            filter,
+        } = &mut e.state
+        else {
             return;
         };
+        let want = *filter;
         match phase {
             ArmPhase::Pickup => {
                 // An unpowered arm can't move, so it mustn't grab anything either.
@@ -1199,6 +1406,7 @@ impl World {
                     let candidates = self.takeable(b);
                     if let Some(item) = candidates
                         .into_iter()
+                        .filter(|&it| want.is_none_or(|w| w == it))
                         .find(|&it| self.accept_capacity(f, it, false) > 0)
                         && self.take_one(b, item)
                     {
@@ -1653,7 +1861,7 @@ mod tests {
         run(&mut w, 5);
         // Item should have reached the end and be waiting there.
         match &w.entity(9, 2).unwrap().state {
-            State::Belt { items } => {
+            State::Belt { items, .. } => {
                 assert_eq!(items.len(), 1);
                 assert_eq!(items[0].pos, TILE_LEN);
             }
@@ -1678,7 +1886,7 @@ mod tests {
         }
         let total: usize = (0..3)
             .map(|x| match &w.entity(x, 1).unwrap().state {
-                State::Belt { items } => {
+                State::Belt { items, .. } => {
                     for pair in items.windows(2) {
                         assert!(pair[1].pos - pair[0].pos >= SPACING);
                     }
@@ -1704,7 +1912,7 @@ mod tests {
         w.insert(f, Item::Glass, 1, false);
         run(&mut w, 3);
         match &w.entity(5, 5).unwrap().state {
-            State::Belt { items } => assert_eq!(items[0].item, Item::Glass),
+            State::Belt { items, .. } => assert_eq!(items[0].item, Item::Glass),
             _ => unreachable!(),
         }
     }
@@ -1889,6 +2097,287 @@ mod tests {
         w.insert(i, Item::RelayModule, UPLINK_GOAL, true);
         run(&mut w, 5 * UPLINK_GOAL + 5);
         assert!(w.won);
+    }
+
+    fn belt_items(w: &World, x: i32, y: i32) -> Vec<Item> {
+        match &w.entity(x, y).unwrap().state {
+            State::Belt { items, .. } => items.iter().map(|b| b.item).collect(),
+            _ => panic!("not a belt"),
+        }
+    }
+
+    /// Puts `n` of `item` on the belt at (x, y), one at a time as room appears.
+    fn feed(w: &mut World, x: i32, y: i32, item: Item, n: u32) {
+        let i = w.idx(x, y).unwrap();
+        w.ensure_caches();
+        let mut left = n;
+        for _ in 0..2000 {
+            if left > 0 && w.insert(i, item, 1, false) == 1 {
+                left -= 1;
+            }
+            w.tick();
+        }
+        assert_eq!(left, 0, "belt never took everything");
+    }
+
+    fn line(w: &mut World, xs: std::ops::Range<i32>, y: i32, kind: EntityKind) {
+        for x in xs {
+            w.place(x, y, kind, Dir::East).unwrap();
+        }
+    }
+
+    #[test]
+    fn splitter_shares_items_between_three_outputs() {
+        let mut w = flat(12, 7);
+        line(&mut w, 0..5, 3, EntityKind::Conveyor);
+        w.place(5, 3, EntityKind::Splitter, Dir::East).unwrap();
+        line(&mut w, 6..9, 3, EntityKind::Conveyor);
+        for y in [2, 1] {
+            w.place(5, y, EntityKind::Conveyor, Dir::North).unwrap();
+        }
+        for y in [4, 5] {
+            w.place(5, y, EntityKind::Conveyor, Dir::South).unwrap();
+        }
+        feed(&mut w, 0, 3, Item::Cog, 12);
+        let ahead: usize = (6..9).map(|x| belt_items(&w, x, 3).len()).sum();
+        let left: usize = [2, 1].iter().map(|&y| belt_items(&w, 5, y).len()).sum();
+        let right: usize = [4, 5].iter().map(|&y| belt_items(&w, 5, y).len()).sum();
+        assert_eq!((ahead, left, right), (4, 4, 4));
+        assert!(belt_items(&w, 5, 3).is_empty());
+    }
+
+    #[test]
+    fn splitter_uses_the_free_output_when_another_is_full() {
+        let mut w = flat(16, 5);
+        line(&mut w, 0..3, 2, EntityKind::Conveyor);
+        w.place(3, 2, EntityKind::Splitter, Dir::East).unwrap();
+        line(&mut w, 4..12, 2, EntityKind::Conveyor);
+        // A one-tile dead end on the left fills up after five items.
+        w.place(3, 1, EntityKind::Conveyor, Dir::North).unwrap();
+        feed(&mut w, 0, 2, Item::Coil, 20);
+        assert_eq!(belt_items(&w, 3, 1).len(), 5);
+        let ahead: usize = (4..12).map(|x| belt_items(&w, x, 2).len()).sum();
+        assert_eq!(ahead, 15);
+    }
+
+    #[test]
+    fn splitter_never_feeds_a_belt_that_points_into_it() {
+        let mut w = flat(10, 5);
+        line(&mut w, 0..2, 2, EntityKind::Conveyor);
+        w.place(2, 2, EntityKind::Splitter, Dir::East).unwrap();
+        line(&mut w, 3..6, 2, EntityKind::Conveyor);
+        // This belt merges in from the side, it is not an output.
+        w.place(2, 1, EntityKind::Conveyor, Dir::South).unwrap();
+        feed(&mut w, 0, 2, Item::Cog, 6);
+        assert!(belt_items(&w, 2, 1).is_empty());
+        let ahead: usize = (3..6).map(|x| belt_items(&w, x, 2).len()).sum();
+        assert_eq!(ahead, 6);
+        // And what it carries joins the flow.
+        feed(&mut w, 2, 1, Item::Coil, 2);
+        let coils = (3..6)
+            .flat_map(|x| belt_items(&w, x, 2))
+            .filter(|&i| i == Item::Coil)
+            .count();
+        assert_eq!(coils, 2);
+    }
+
+    #[test]
+    fn tunnel_carries_items_under_buildings() {
+        let mut w = flat(14, 5);
+        line(&mut w, 0..3, 2, EntityKind::Conveyor);
+        w.place(3, 2, EntityKind::TunnelIn, Dir::East).unwrap();
+        w.place(4, 2, EntityKind::Crate, Dir::North).unwrap();
+        // A belt crossing over the top must not pick anything up.
+        w.place(5, 2, EntityKind::Conveyor, Dir::South).unwrap();
+        w.place(6, 2, EntityKind::Crate, Dir::North).unwrap();
+        w.place(7, 2, EntityKind::TunnelOut, Dir::East).unwrap();
+        line(&mut w, 8..11, 2, EntityKind::Conveyor);
+        w.ensure_caches();
+        let (a, b) = (w.idx(3, 2).unwrap(), w.idx(7, 2).unwrap());
+        assert_eq!(w.tunnel_pair(a), Some(b));
+        assert_eq!(w.tunnel_pair(b), Some(a));
+        feed(&mut w, 0, 2, Item::Chip, 6);
+        let out: usize = (8..11).map(|x| belt_items(&w, x, 2).len()).sum();
+        assert_eq!(out, 6);
+        assert!(belt_items(&w, 5, 2).is_empty());
+        assert_eq!(w.entity(4, 2).unwrap().contents().total(), 0);
+        assert_eq!(w.entity(3, 2).unwrap().status, Status::Idle);
+    }
+
+    #[test]
+    fn tunnel_holds_a_full_line_underground() {
+        // Nothing takes items at the far end, so the whole run backs up, spaced as on a belt.
+        let mut w = flat(10, 3);
+        w.place(1, 1, EntityKind::TunnelIn, Dir::East).unwrap();
+        w.place(5, 1, EntityKind::TunnelOut, Dir::East).unwrap();
+        let i = w.idx(1, 1).unwrap();
+        w.ensure_caches();
+        let mut put = 0;
+        for _ in 0..1000 {
+            put += w.insert(i, Item::Cog, 1, false);
+            w.tick();
+        }
+        let (State::Belt { items: under, .. }, State::Belt { items: exit, .. }) = (
+            &w.entity(1, 1).unwrap().state,
+            &w.entity(5, 1).unwrap().state,
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(under.len() + exit.len(), put as usize);
+        // The exit tile is full, and so is the stretch underground beyond the entrance tile.
+        assert_eq!(exit.len(), 5);
+        assert!(under.iter().filter(|b| b.pos > TILE_LEN).count() >= 12);
+        for pair in under.windows(2) {
+            assert!(pair[1].pos - pair[0].pos >= SPACING);
+        }
+        // Arms only reach what is on the surface.
+        assert!(w.takeable(i).len() <= 1);
+        let before = under.len();
+        while w.take_one(i, Item::Cog) {}
+        let State::Belt { items: under, .. } = &w.entity(1, 1).unwrap().state else {
+            unreachable!()
+        };
+        assert!(under.iter().all(|b| b.pos > TILE_LEN));
+        assert!(under.len() < before && !under.is_empty());
+    }
+
+    #[test]
+    fn tunnel_ends_out_of_reach_or_misaligned_stay_unlinked() {
+        let mut w = flat(20, 8);
+        // Too far apart.
+        w.place(1, 1, EntityKind::TunnelIn, Dir::East).unwrap();
+        w.place(1 + TUNNEL_REACH + 1, 1, EntityKind::TunnelOut, Dir::East)
+            .unwrap();
+        // Facing different ways.
+        w.place(1, 3, EntityKind::TunnelIn, Dir::East).unwrap();
+        w.place(4, 3, EntityKind::TunnelOut, Dir::West).unwrap();
+        // Two entrances share the nearer exit: only the nearer entrance gets it.
+        w.place(1, 5, EntityKind::TunnelIn, Dir::East).unwrap();
+        w.place(3, 5, EntityKind::TunnelIn, Dir::East).unwrap();
+        w.place(5, 5, EntityKind::TunnelOut, Dir::East).unwrap();
+        w.tick();
+        for (x, y) in [(1, 1), (7, 1), (1, 3), (4, 3), (1, 5)] {
+            let i = w.idx(x, y).unwrap();
+            assert_eq!(w.tunnel_pair(i), None, "({x}, {y})");
+            assert_eq!(w.entity(x, y).unwrap().status, Status::Unlinked);
+        }
+        assert_eq!(w.tunnel_pair(w.idx(3, 5).unwrap()), w.idx(5, 5));
+        // An unlinked entrance keeps what it is given on the surface.
+        let i = w.idx(1, 1).unwrap();
+        assert_eq!(w.insert(i, Item::Cog, 1, false), 1);
+        run(&mut w, 3);
+        assert_eq!(belt_items(&w, 1, 1), vec![Item::Cog]);
+        // Removing the exit of a working tunnel strands nothing: the entrance still holds it.
+        let i = w.idx(3, 5).unwrap();
+        assert_eq!(w.insert(i, Item::Chip, 1, false), 1);
+        for _ in 0..3 {
+            w.tick();
+        }
+        w.remove(5, 5);
+        run(&mut w, 2);
+        assert_eq!(belt_items(&w, 3, 5), vec![Item::Chip]);
+        assert_eq!(w.tunnel_pair(i), None);
+        // It waits underground, out of an arm's reach, until there is an exit again.
+        assert!(w.takeable(i).is_empty());
+        w.place(5, 5, EntityKind::TunnelOut, Dir::East).unwrap();
+        run(&mut w, 2);
+        assert_eq!(belt_items(&w, 5, 5), vec![Item::Chip]);
+    }
+
+    #[test]
+    fn belt_loops_keep_moving() {
+        // A closed loop has no "end" to start from; the update order must still move it.
+        let mut w = flat(6, 6);
+        w.place(1, 1, EntityKind::Conveyor, Dir::East).unwrap();
+        w.place(2, 1, EntityKind::Conveyor, Dir::South).unwrap();
+        w.place(2, 2, EntityKind::Conveyor, Dir::West).unwrap();
+        w.place(1, 2, EntityKind::Conveyor, Dir::North).unwrap();
+        let i = w.idx(1, 1).unwrap();
+        w.ensure_caches();
+        assert_eq!(w.insert(i, Item::Cog, 1, false), 1);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..200 {
+            w.tick();
+            for (x, y) in [(1, 1), (2, 1), (2, 2), (1, 2)] {
+                if !belt_items(&w, x, y).is_empty() {
+                    seen.insert((x, y));
+                }
+            }
+        }
+        assert_eq!(seen.len(), 4);
+    }
+
+    #[test]
+    fn long_arm_reaches_over_a_tile() {
+        let mut w = flat(12, 8);
+        w.place(2, 2, EntityKind::Crate, Dir::North).unwrap();
+        // The tiles next to the arm are in the way of an ordinary one.
+        w.place(3, 2, EntityKind::Conveyor, Dir::North).unwrap();
+        w.place(4, 2, EntityKind::LongArm, Dir::East).unwrap();
+        w.place(5, 2, EntityKind::Conveyor, Dir::North).unwrap();
+        w.place(6, 2, EntityKind::Crate, Dir::North).unwrap();
+        power(&mut w, 4, 4);
+        let c = w.idx(2, 2).unwrap();
+        w.insert(c, Item::Cog, 5, true);
+        run(&mut w, 20);
+        assert_eq!(crate_count(&w, 6, 2, Item::Cog), 5);
+        assert!(belt_items(&w, 3, 2).is_empty());
+        assert!(belt_items(&w, 5, 2).is_empty());
+    }
+
+    #[test]
+    fn filter_arm_moves_only_its_item() {
+        let mut w = flat(12, 8);
+        w.place(2, 2, EntityKind::Crate, Dir::North).unwrap();
+        w.place(3, 2, EntityKind::FilterArm, Dir::East).unwrap();
+        w.place(4, 2, EntityKind::Crate, Dir::North).unwrap();
+        power(&mut w, 3, 4);
+        let c = w.idx(2, 2).unwrap();
+        w.insert(c, Item::Cog, 4, true);
+        w.insert(c, Item::Coil, 4, true);
+        if let State::Arm { filter, .. } = &mut w.entity_mut(3, 2).unwrap().state {
+            *filter = Some(Item::Coil);
+        }
+        run(&mut w, 15);
+        assert_eq!(crate_count(&w, 4, 2, Item::Coil), 4);
+        assert_eq!(crate_count(&w, 4, 2, Item::Cog), 0);
+        // With no filter it moves whatever is there.
+        if let State::Arm { filter, .. } = &mut w.entity_mut(3, 2).unwrap().state {
+            *filter = None;
+        }
+        run(&mut w, 15);
+        assert_eq!(crate_count(&w, 4, 2, Item::Cog), 4);
+    }
+
+    #[test]
+    fn logistics_state_survives_a_save() {
+        let mut w = flat(12, 6);
+        line(&mut w, 0..2, 2, EntityKind::Conveyor);
+        w.place(2, 2, EntityKind::Splitter, Dir::East).unwrap();
+        w.place(3, 2, EntityKind::TunnelIn, Dir::East).unwrap();
+        w.place(6, 2, EntityKind::TunnelOut, Dir::East).unwrap();
+        w.place(2, 1, EntityKind::Conveyor, Dir::North).unwrap();
+        w.place(8, 4, EntityKind::FilterArm, Dir::South).unwrap();
+        if let State::Arm { filter, .. } = &mut w.entity_mut(8, 4).unwrap().state {
+            *filter = Some(Item::Lens);
+        }
+        feed(&mut w, 0, 2, Item::Cog, 7);
+        let json = serde_json::to_string(&w.to_save()).unwrap();
+        let mut back = World::from_save(serde_json::from_str(&json).unwrap()).unwrap();
+        let states = |w: &World| -> Vec<Option<(EntityKind, Dir, State)>> {
+            w.entities
+                .iter()
+                .map(|e| e.as_ref().map(|e| (e.kind, e.dir, e.state.clone())))
+                .collect()
+        };
+        assert_eq!(states(&back), states(&w));
+        // Links are rebuilt, and both worlds carry on identically.
+        for _ in 0..200 {
+            w.tick();
+            back.tick();
+        }
+        assert_eq!(back.entities, w.entities);
+        assert_eq!(back.tunnel_pair(back.idx(3, 2).unwrap()), back.idx(6, 2));
     }
 
     #[test]
