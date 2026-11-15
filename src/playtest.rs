@@ -169,6 +169,94 @@ pub fn build_demo_factory(g: &mut Game) {
     run(g, 30);
 }
 
+/// Finds a clear grass rectangle near spawn.
+fn find_clear(g: &Game, w: i32, h: i32) -> Option<(i32, i32)> {
+    let (cx, cy) = g.world.spawn();
+    let mut best: Option<((i32, i32), i32)> = None;
+    for y in cy - 35..cy + 35 {
+        for x in cx - 45..cx + 45 {
+            let ok = (0..h).all(|dy| {
+                (0..w).all(|dx| {
+                    g.world
+                        .tile(x + dx, y + dy)
+                        .is_some_and(|t| t.terrain != Terrain::Water && t.ore.is_none())
+                        && g.world.entity(x + dx, y + dy).is_none()
+                })
+            });
+            let d = (x + w / 2 - cx).abs() + (y + h / 2 - cy).abs();
+            if ok && best.is_none_or(|(_, bd)| d < bd) {
+                best = Some(((x, y), d));
+            }
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// A busier mid-game block for screenshots: two conveyor lines feeding rows of fabricators.
+/// Returns the position of one fabricator.
+pub fn build_showcase(g: &mut Game) -> (i32, i32) {
+    for t in ["fabrication", "logistics", "logic", "metallurgy"] {
+        g.world.research.complete(TechId::by_id(t).unwrap());
+    }
+    for (i, n) in [
+        (Item::Fabricator, 6),
+        (Item::Arm, 12),
+        (Item::SwiftArm, 2),
+        (Item::Conveyor, 20),
+        (Item::ExpressConveyor, 20),
+        (Item::Crate, 8),
+        (Item::Pylon, 8),
+        (Item::Generator, 1),
+        (Item::IronIngot, 400),
+        (Item::CopperIngot, 400),
+        (Item::Lignite, 50),
+    ] {
+        g.player.inventory.add(i, n);
+    }
+    let (x0, y0) = find_clear(g, 22, 13).expect("clear area");
+    let (top, bot, mid) = (y0 + 4, y0 + 8, y0 + 6);
+    let place = |g: &mut Game, x, y, item, d| g.place(x, y, item, d).unwrap();
+    // Crates of ingots loaded onto the two lines by swift arms.
+    place(g, x0, top, Item::Crate, Dir::North);
+    g.insert(x0, top, Item::IronIngot, 400);
+    place(g, x0 + 1, top, Item::SwiftArm, Dir::East);
+    place(g, x0, bot, Item::Crate, Dir::North);
+    g.insert(x0, bot, Item::CopperIngot, 400);
+    place(g, x0 + 1, bot, Item::SwiftArm, Dir::East);
+    for x in x0 + 2..x0 + 20 {
+        place(g, x, top, Item::ExpressConveyor, Dir::East);
+        place(g, x, bot, Item::Conveyor, Dir::East);
+    }
+    let mut fab = (0, 0);
+    for (k, x) in [x0 + 5, x0 + 10, x0 + 15].into_iter().enumerate() {
+        // Cogs above the iron line.
+        place(g, x, top - 1, Item::Arm, Dir::North);
+        place(g, x, top - 2, Item::Fabricator, Dir::North);
+        g.set_recipe(x, top - 2, RecipeId::by_id("cog")).unwrap();
+        place(g, x, top - 3, Item::Arm, Dir::North);
+        place(g, x, top - 4, Item::Crate, Dir::North);
+        place(g, x + 1, top - 2, Item::Pylon, Dir::North);
+        // Coils below the copper line.
+        place(g, x, bot + 1, Item::Arm, Dir::South);
+        place(g, x, bot + 2, Item::Fabricator, Dir::North);
+        g.set_recipe(x, bot + 2, RecipeId::by_id("coil")).unwrap();
+        place(g, x, bot + 3, Item::Arm, Dir::South);
+        place(g, x, bot + 4, Item::Crate, Dir::North);
+        place(g, x + 1, bot + 2, Item::Pylon, Dir::North);
+        if k == 1 {
+            fab = (x, top - 2);
+        }
+    }
+    // Power between the two lines.
+    place(g, x0 + 3, mid, Item::Pylon, Dir::North);
+    place(g, x0 + 6, mid, Item::Pylon, Dir::North);
+    place(g, x0 + 7, mid, Item::Generator, Dir::North);
+    g.insert(x0 + 7, mid, Item::Lignite, 50);
+    run(g, 40);
+    g.player.cursor = fab;
+    fab
+}
+
 fn crate_take(g: &mut Game, pos: (i32, i32)) -> u32 {
     g.take_output(pos.0, pos.1)
 }
@@ -373,5 +461,17 @@ mod tests {
         assert!(g.world.won);
         assert!(g.victory_pending);
         assert_eq!(g.world.entity(10, 11).unwrap().kind, EntityKind::Uplink);
+    }
+
+    #[test]
+    fn showcase_factory_runs() {
+        let mut g = Game::new(11);
+        build_demo_factory(&mut g);
+        let (x, y) = build_showcase(&mut g);
+        run(&mut g, 20);
+        let e = g.world.entity(x, y).unwrap();
+        assert!(!e.status.is_problem(), "fabricator status {:?}", e.status);
+        assert!(g.world.produced.get(&Item::Cog).copied().unwrap_or(0) > 20);
+        assert!(g.world.produced.get(&Item::Coil).copied().unwrap_or(0) > 20);
     }
 }

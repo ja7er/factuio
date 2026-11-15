@@ -1778,9 +1778,28 @@ mod tests {
         };
         let mut a = app();
         crate::playtest::build_demo_factory(a.game.as_mut().unwrap());
-        let (x, y) = a.game.as_ref().unwrap().player.cursor;
+        let kiln = a.game.as_ref().unwrap().player.cursor;
+        let (x, y) = crate::playtest::build_showcase(a.game.as_mut().unwrap());
+        // Logo on its own, for the README.
+        let mut logo = String::from(
+            "<html><body style='background:#0c0c10;margin:0'><pre id='logo' style='display:inline-block;font:bold 22px/24px Menlo,monospace;margin:0;padding:18px 28px'>",
+        );
+        for (k, l) in LOGO.iter().enumerate() {
+            let (r, g, b) = blend(
+                (255, 170, 60),
+                (120, 200, 255),
+                k as f32 / LOGO.len() as f32,
+            );
+            let l = l.replace('&', "&amp;").replace('<', "&lt;");
+            logo.push_str(&format!(
+                "<span style='color:rgb({r},{g},{b})'>{l}</span>\n"
+            ));
+        }
+        logo.push_str("</pre></body></html>");
+        std::fs::write(format!("{dir}/logo.html"), logo).unwrap();
         let shots = vec![
             ("title", None),
+            ("factory", Some(Modal::None)),
             ("map", Some(Modal::None)),
             ("craft", Some(Modal::Craft { sel: 3 })),
             ("research", Some(Modal::Research { sel: 0 })),
@@ -1801,11 +1820,17 @@ mod tests {
             let mut t = Terminal::new(TestBackend::new(140, 42)).unwrap();
             match m {
                 None => {
-                    let b = App::new(std::env::temp_dir().join("x-none.json"), None, false);
+                    let b = App::new(
+                        std::path::PathBuf::from("~/.factuio/save.json"),
+                        None,
+                        false,
+                    );
                     t.draw(|f| draw(f, &b)).unwrap();
                 }
                 Some(m) => {
                     a.modal = m;
+                    let g = a.game.as_mut().unwrap();
+                    g.player.cursor = if name == "map" { kiln } else { (x, y) };
                     t.draw(|f| draw(f, &a)).unwrap();
                 }
             }
