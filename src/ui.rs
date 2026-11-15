@@ -509,6 +509,83 @@ fn ghost_entity(kind: EntityKind, dir: Dir) -> Entity {
     e
 }
 
+fn cell_spans(cells: &Cell2) -> Vec<Span<'static>> {
+    cells
+        .iter()
+        .map(|(c, fg, bg, bold)| {
+            let mut st = Style::default().fg(col(*fg)).bg(col(*bg));
+            if *bold {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            Span::styled(c.to_string(), st)
+        })
+        .collect()
+}
+
+/// How an item looks on the map, for lists and the hotbar: a building as it stands working,
+/// landfill and carts as their placement marks, anything else as its belt letter.
+fn item_chip(item: Item, ascii: bool) -> Vec<Span<'static>> {
+    let ground = (40, 40, 40);
+    let cells: Cell2 = match item.building() {
+        Some(EntityKind::Rail) => rail_cells(2 | 8, ascii, entity_bg(EntityKind::Rail)),
+        Some(k) => {
+            let mut e = Entity::new(k, Dir::East);
+            e.status = Status::Working;
+            let mut cells = entity_cells(&e, ascii, ground, 0, 0);
+            // A new fabricator has no recipe yet; that's not a problem worth a red mark here.
+            if cells[1].0 == '?' {
+                cells[1] = (
+                    if ascii { '.' } else { '·' },
+                    (130, 130, 130),
+                    cells[1].2,
+                    false,
+                );
+            }
+            cells
+        }
+        None if item == Item::Cart => [
+            (if ascii { 'O' } else { '■' }, CART_RGB, ground, true),
+            (' ', CART_RGB, ground, false),
+        ],
+        None if item == Item::Landfill => [('=', (240, 220, 170), (120, 104, 70), true); 2],
+        None => [
+            (item.glyph(), item_rgb(item), ground, true),
+            (' ', ground, ground, false),
+        ],
+    };
+    cell_spans(&cells)
+}
+
+/// The two glyphs an ore patch shows: richer patches are denser. Each ore has its own shape,
+/// so patches are told apart without relying on colour.
+fn ore_cells(ore: Item, amount: u32, ascii: bool, h: u32) -> (char, char) {
+    if ascii {
+        return if amount > 600 {
+            (':', ':')
+        } else if amount > 200 {
+            (':', '.')
+        } else {
+            ('.', ' ')
+        };
+    }
+    let g = match ore {
+        Item::FerriteOre => '▪',
+        Item::MalachiteOre => '◆',
+        Item::Lignite => '●',
+        Item::Quartz => '✦',
+        _ => ':',
+    };
+    let pair = if amount > 600 {
+        (g, '·')
+    } else if amount > 200 {
+        (g, ' ')
+    } else {
+        ('·', ' ')
+    };
+    // Alternate sides so a patch reads as scattered rock rather than a grid.
+    if h & 1 == 0 { pair } else { (pair.1, pair.0) }
+}
+
 struct MapView<'a> {
     app: &'a App,
     game: &'a Game,
@@ -616,14 +693,10 @@ impl Widget for MapView<'_> {
                         ]
                     }
                     (_, Some(ore)) => {
-                        let (a, b) = if tile.amount > 600 {
-                            (':', ':')
-                        } else if tile.amount > 200 {
-                            (':', '.')
-                        } else {
-                            ('.', ' ')
-                        };
-                        let fg = blend(item_rgb(ore), bg, 0.35);
+                        let h = (x as u32).wrapping_mul(0x9E37_79B1)
+                            ^ (y as u32).wrapping_mul(0x85EB_CA77);
+                        let (a, b) = ore_cells(ore, tile.amount, ascii, (h ^ (h >> 13)) >> 7);
+                        let fg = blend(item_rgb(ore), bg, if ascii { 0.35 } else { 0.25 });
                         [(a, fg, bg, false), (b, fg, bg, false)]
                     }
                     (Terrain::Sand, None) => [(' ', bg, bg, false), (' ', bg, bg, false)],
@@ -1096,7 +1169,7 @@ fn draw_game(f: &mut Frame, app: &App, game: &Game) {
 
     match &app.modal {
         Modal::Craft { sel } => draw_craft(f, app, game, *sel),
-        Modal::Build { sel } => draw_build(f, game, *sel),
+        Modal::Build { sel } => draw_build(f, app, game, *sel),
         Modal::Research { sel } => draw_research(f, app, game, *sel),
         Modal::Entity { x, y, sub, sel } => draw_entity_panel(f, app, game, *x, *y, sub, *sel),
         Modal::Menu { sel } => draw_menu(f, *sel),
@@ -1320,14 +1393,22 @@ fn entity_detail(
     let w = &game.world;
     let Some(e) = w.entity(x, y) else { return };
     let ascii = app.ascii;
-    lines.push(Line::from(vec![
-        Span::styled(e.kind.name(), Style::default().add_modifier(Modifier::BOLD)),
-        if e.kind.directional() {
-            dim(format!(" facing {:?}", e.dir))
-        } else {
-            Span::raw("")
-        },
-    ]));
+    let mut head = cell_spans(&entity_cells(e, ascii, (40, 40, 40), w.transmitted, w.tick));
+    head.push(Span::raw(" "));
+    lines.push(Line::from(
+        [
+            head,
+            vec![
+                Span::styled(e.kind.name(), Style::default().add_modifier(Modifier::BOLD)),
+                if e.kind.directional() {
+                    dim(format!(" facing {:?}", e.dir))
+                } else {
+                    Span::raw("")
+                },
+            ],
+        ]
+        .concat(),
+    ));
     lines.push(Line::from(vec![
         Span::raw("Status: "),
         Span::styled(
@@ -1670,7 +1751,12 @@ fn draw_sidebar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
     };
     lines.push(Line::from(format!("({x}, {y}) {terr}")));
     if let Some(o) = tile.ore.filter(|_| explored) {
+        let (a, _) = ore_cells(o, 1000, app.ascii, 0);
         lines.push(Line::from(vec![
+            Span::styled(
+                format!("{a} "),
+                Style::default().fg(col(item_rgb(o))).bg(col(ore_bg(o))),
+            ),
             item_span(o),
             Span::raw(format!(" × {}", tile.amount)),
         ]));
@@ -1827,6 +1913,28 @@ fn draw_sidebar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
 }
 
 fn draw_hotbar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
+    // Each slot shows its building as it looks on the map, when there's room for it.
+    let plain: usize = game
+        .player
+        .hotbar
+        .iter()
+        .enumerate()
+        .map(|(k, slot)| {
+            let n = if k == 9 { 0 } else { k + 1 };
+            match slot {
+                None => format!(" {n}:-  ").chars().count(),
+                Some(item) => {
+                    let name = item
+                        .building()
+                        .map(|b| b.short_name())
+                        .unwrap_or(item.name());
+                    let count = game.player.inventory.count(*item);
+                    format!(" {n}:{name} {count} ").chars().count() + 1
+                }
+            }
+        })
+        .sum();
+    let chips = plain + 2 * game.player.hotbar.iter().flatten().count() <= area.width as usize;
     let mut spans = vec![];
     let mut hits = vec![];
     let mut x = area.x;
@@ -1855,10 +1963,23 @@ fn draw_hotbar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
             Style::default().fg(col((230, 230, 230)))
         };
         let label = format!(" {n}:{name} {count} ");
-        let w = label.chars().count() as u16;
+        let mut w = label.chars().count() as u16;
+        if chips {
+            let mut chip = item_chip(*item, app.ascii);
+            if count == 0 {
+                for s in &mut chip {
+                    s.style = s.style.add_modifier(Modifier::DIM);
+                }
+            }
+            spans.push(Span::styled(format!(" {n}:"), style));
+            spans.extend(chip);
+            spans.push(Span::styled(format!("{name} {count} "), style));
+            w += 2;
+        } else {
+            spans.push(Span::styled(label, style));
+        }
         hits.push((Rect::new(x, area.y, w, 1), k));
         x += w + 1;
-        spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
     }
     *app.hotbar_hits.borrow_mut() = hits;
@@ -2090,14 +2211,14 @@ fn draw_craft(f: &mut Frame, app: &App, game: &Game, sel: usize) {
     );
 }
 
-fn draw_build(f: &mut Frame, game: &Game, sel: usize) {
-    let area = centered(f.area(), 80, 22);
+fn draw_build(f: &mut Frame, app: &App, game: &Game, sel: usize) {
+    let area = centered(f.area(), 84, 22);
     f.render_widget(Clear, area);
     let block = modal_block("Buildings");
     let inner = block.inner(area);
     f.render_widget(block, area);
     let [left, right] =
-        Layout::horizontal([Constraint::Length(28), Constraint::Min(20)]).areas(inner);
+        Layout::horizontal([Constraint::Length(32), Constraint::Min(20)]).areas(inner);
     let items: Vec<Item> = Item::placeable().collect();
     let sel = sel.min(items.len() - 1);
     let rows: Vec<Line> = items
@@ -2110,13 +2231,14 @@ fn draw_build(f: &mut Frame, game: &Game, sel: usize) {
             } else {
                 col((110, 110, 110))
             };
-            list_line(
-                vec![
-                    Span::styled(format!(" {:<20}", item.name()), Style::default().fg(c)),
-                    Span::raw(format!("{n:>4}")),
-                ],
-                k == sel,
-            )
+            let mut row = vec![Span::raw(" ")];
+            row.extend(item_chip(*item, app.ascii));
+            row.push(Span::styled(
+                format!(" {:<20}", item.name()),
+                Style::default().fg(c),
+            ));
+            row.push(Span::raw(format!("{n:>4}")));
+            list_line(row, k == sel)
         })
         .collect();
     f.render_widget(
@@ -3108,8 +3230,8 @@ SETTINGS
   next_alert, minimap.
 
 MAP LEGEND
-  :: .       ore (brighter = richer). ferrite (blue), malachite (green),
-             lignite (dark), quartz (pale)
+  ▪ ◆ ● ✦    ore: ferrite (blue ▪), malachite (green ◆), lignite (grey ●),
+             quartz (pale ✦); denser = richer. ASCII shows : and .
   →  ↑       conveyor; items ride on it shown by their letter
   Y→         splitter: shares items between the belts ahead, left and right
   →∪  ∩→     tunnel entrance and exit (ASCII: u and n)
@@ -3126,6 +3248,7 @@ MAP LEGEND
   ■g         rail cart and its cargo (ASCII O)
   V◜         survey mast (spins while it surveys)
   ░          unexplored
+  The hotbar and building list show each building as it looks here.
   A bold white letter means working; red means something is wrong, and a
   blinking ! marks the building. Working kilns glow and smoke, generators
   flicker, and arms swing their load across.
@@ -3479,6 +3602,35 @@ mod tests {
         assert_eq!(map_buffer(&a)[(19, 5)].symbol(), "!");
         a.frame = 8;
         assert_ne!(map_buffer(&a)[(19, 5)].symbol(), "!");
+    }
+
+    #[test]
+    fn ores_have_their_own_shapes_and_chips_match_the_map() {
+        let shapes: Vec<char> = [
+            Item::FerriteOre,
+            Item::MalachiteOre,
+            Item::Lignite,
+            Item::Quartz,
+        ]
+        .iter()
+        .map(|&o| ore_cells(o, 1000, false, 0).0)
+        .collect();
+        let mut unique = shapes.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), 4, "{shapes:?}");
+        assert_eq!(ore_cells(Item::Quartz, 50, false, 0), ('·', ' '));
+        assert_eq!(ore_cells(Item::Quartz, 1000, true, 1), (':', ':'));
+        let text = |item| {
+            item_chip(item, false)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(text(Item::Digger), "D→");
+        assert_eq!(text(Item::Depot), "R+");
+        assert_eq!(text(Item::Rail), "══");
+        assert_eq!(text(Item::Fabricator), "M·");
+        assert_eq!(text(Item::Cart), "■ ");
     }
 
     #[test]

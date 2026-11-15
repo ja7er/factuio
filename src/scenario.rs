@@ -191,7 +191,7 @@ fn tech(g: &Game, id: &str) -> bool {
 pub static STEPS: &[Step] = &[
     Step {
         title: "Look around",
-        text: "Move the cursor with the arrow keys or WASD (Shift moves 8 tiles). Ore shows as coloured dots: put the cursor on some.",
+        text: "Move the cursor with the arrow keys or WASD (Shift moves 8 tiles). Ore patches are scattered coloured shapes: put the cursor on some.",
         done: |g, _| {
             let (x, y) = g.player.cursor;
             g.world.tile(x, y).is_some_and(|t| t.ore.is_some()) && g.world.is_explored(x, y)
