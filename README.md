@@ -1,12 +1,14 @@
-# factuio
+<p align="center">
+  <img src="docs/logo.png" alt="factuio" width="560">
+</p>
 
-A factory-automation game for your terminal, written in Rust with [ratatui](https://ratatui.rs).
+<p align="center"><b>A factory-automation game for your terminal</b>, written in Rust with <a href="https://ratatui.rs">ratatui</a>.</p>
 
 Start with a handful of buildings on a procedurally generated map. Mine ore, smelt it,
 move it around on conveyors and arms, craft parts, research new technology, and finally
 build the **Uplink array** and feed it 20 relay modules to win.
 
-![The map](docs/screenshot-map.png)
+![A mid-game factory: conveyor lines feeding fabricators that make cogs and coils](docs/screenshot-factory.png)
 
 ## Install and run
 
@@ -34,6 +36,17 @@ Options:
 
 A terminal of at least 100×30 is recommended. Colours are 24-bit when your terminal
 advertises it through `COLORTERM`; otherwise they fall back to the 256-colour palette.
+
+## Screenshots
+
+| | |
+| --- | --- |
+| ![Title screen](docs/screenshot-title.png) | ![Starter base: diggers feeding kilns, arms moving ingots into crates](docs/screenshot-map.png) |
+| Title screen | A starter base: diggers feeding kilns, arms unloading into crates |
+| ![Crafting and inventory](docs/screenshot-craft.png) | ![Research tree](docs/screenshot-research.png) |
+| Hand crafting, with missing intermediates made automatically | The research tree |
+| ![Inspecting a fabricator](docs/screenshot-entity.png) | ![Production statistics](docs/screenshot-stats.png) |
+| Inspecting a fabricator | Production statistics and power grids |
 
 ## Controls
 
@@ -108,6 +121,9 @@ The sidebar always shows a **Goal** line telling you what to do next.
 cargo test            # simulation, crafting, save/load, UI rendering, scripted playthroughs
 cargo clippy --all-targets
 ```
+
+The screenshots are rendered from the real UI: `FACTUIO_DUMP=<dir> cargo test dump_screens -- --ignored`
+writes HTML snapshots of each screen (and the logo) that can be captured with any headless browser.
 
 Code layout:
 
