@@ -176,9 +176,99 @@ impl Research {
     }
 }
 
+/// The techs laid out for the tree view: one column per tier, where a tech's tier is one more
+/// than its deepest prerequisite's. Within a column, techs sit near the prerequisites they
+/// build on, so the eye can follow a chain across.
+pub fn tech_tiers() -> Vec<Vec<TechId>> {
+    let prereqs = |t: TechId| t.get().prereqs.iter().filter_map(|p| TechId::by_id(p));
+    let n = TECHS.len();
+    let mut tier = vec![usize::MAX; n];
+    // Prerequisites come first in TECHS, but don't rely on it: settle until nothing changes.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for t in TechId::all() {
+            let mut d = 0;
+            let mut known = true;
+            for p in prereqs(t) {
+                match tier[p.0 as usize] {
+                    usize::MAX => known = false,
+                    pd => d = d.max(pd + 1),
+                }
+            }
+            if known && tier[t.0 as usize] != d {
+                tier[t.0 as usize] = d;
+                changed = true;
+            }
+        }
+    }
+    let depth = tier
+        .iter()
+        .filter(|&&d| d != usize::MAX)
+        .max()
+        .map_or(0, |d| d + 1);
+    let mut cols: Vec<Vec<TechId>> = vec![vec![]; depth];
+    let mut row = vec![0.0f32; n];
+    for (c, col) in cols.iter_mut().enumerate() {
+        let mut here: Vec<(f32, TechId)> = TechId::all()
+            .filter(|t| tier[t.0 as usize] == c)
+            .map(|t| {
+                let rows: Vec<f32> = prereqs(t).map(|p| row[p.0 as usize]).collect();
+                let at = if rows.is_empty() {
+                    t.0 as f32
+                } else {
+                    rows.iter().sum::<f32>() / rows.len() as f32
+                };
+                (at, t)
+            })
+            .collect();
+        here.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (k, &(_, t)) in here.iter().enumerate() {
+            row[t.0 as usize] = k as f32;
+        }
+        *col = here.into_iter().map(|(_, t)| t).collect();
+    }
+    cols
+}
+
+/// Where `t` sits in `tech_tiers()`: (column, row).
+pub fn tree_pos(tiers: &[Vec<TechId>], t: TechId) -> (usize, usize) {
+    for (c, col) in tiers.iter().enumerate() {
+        if let Some(r) = col.iter().position(|&x| x == t) {
+            return (c, r);
+        }
+    }
+    (0, 0)
+}
+
+/// Techs that list `t` as a direct prerequisite.
+pub fn leads_to(t: TechId) -> Vec<TechId> {
+    let id = t.get().id;
+    TechId::all()
+        .filter(|u| u.get().prereqs.contains(&id))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_puts_every_tech_after_its_prerequisites() {
+        let tiers = tech_tiers();
+        let placed: usize = tiers.iter().map(|c| c.len()).sum();
+        assert_eq!(placed, TECHS.len());
+        assert_eq!(tiers[0], vec![TechId::by_id("fabrication").unwrap()]);
+        for t in TechId::all() {
+            let (c, _) = tree_pos(&tiers, t);
+            for p in t.get().prereqs {
+                let (pc, _) = tree_pos(&tiers, TechId::by_id(p).unwrap());
+                assert!(pc < c, "{} sits before its prerequisite {p}", t.get().id);
+            }
+        }
+        let fab = TechId::by_id("fabrication").unwrap();
+        assert!(leads_to(fab).contains(&TechId::by_id("logistics").unwrap()));
+    }
 
     #[test]
     fn prereqs_gate_research() {

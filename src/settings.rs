@@ -53,6 +53,22 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Whether to use the colour-blind safe palette.
+    pub fn colorblind(&self) -> bool {
+        matches!(
+            self.palette.to_ascii_lowercase().as_str(),
+            "colorblind" | "colourblind" | "color-blind" | "colour-blind"
+        )
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, json)
+    }
+
     /// Loads settings, writing a default file first if there is none. Errors fall back to defaults.
     pub fn load_or_create(path: &Path) -> (Settings, Option<String>) {
         match std::fs::read_to_string(path) {
@@ -136,6 +152,21 @@ mod tests {
         let (m, _) = s.key_map();
         assert_eq!(m.translate('x'), Some('m'));
         assert_eq!(m.translate('m'), Some('x'));
+    }
+
+    #[test]
+    fn palette_names_and_saving() {
+        let mut s = Settings::default();
+        assert!(!s.colorblind());
+        s.palette = "Colourblind".into();
+        assert!(s.colorblind());
+        let dir = std::env::temp_dir().join(format!("factuio-settings-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        s.save(&path).unwrap();
+        let (back, warning) = Settings::load_or_create(&path);
+        assert!(warning.is_none());
+        assert_eq!(back, s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

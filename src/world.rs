@@ -1415,6 +1415,27 @@ impl World {
         m
     }
 
+    /// How many of `item` were made in each of the last `buckets` spans of `per` history
+    /// snapshots, oldest first. Spans from before the history starts count as `None`.
+    pub fn production_series(&self, item: Item, buckets: usize, per: usize) -> Vec<Option<u64>> {
+        let count = |m: &BTreeMap<Item, u64>| m.get(&item).copied().unwrap_or(0);
+        // Totals at each snapshot, newest last. Only whole spans count, so the newest one
+        // doesn't dip while it's still filling up.
+        let totals: Vec<u64> = self.history.iter().map(|(_, m)| count(m)).collect();
+        let mut out = vec![None; buckets];
+        let Some(end) = totals.len().checked_sub(1) else {
+            return out;
+        };
+        for (k, slot) in out.iter_mut().rev().enumerate() {
+            let (Some(hi), Some(lo)) = (end.checked_sub(k * per), end.checked_sub((k + 1) * per))
+            else {
+                break;
+            };
+            *slot = Some(totals[hi] - totals[lo]);
+        }
+        out
+    }
+
     /// Production per minute of `item` over roughly the last `window` seconds.
     pub fn rate_per_min(&self, item: Item, window: u64) -> f32 {
         let now = self.produced.get(&item).copied().unwrap_or(0);
@@ -2951,6 +2972,18 @@ mod tests {
         // A digger mines 0.5 ore/s = 30/min.
         let r = w.rate_per_min(Item::Quartz, 60);
         assert!((r - 30.0).abs() < 3.0, "rate {r}");
+        // 70 s of history (a snapshot every 5 s) holds 2 whole 30 s spans of about 15 ore.
+        let series = w.production_series(Item::Quartz, 4, 6);
+        assert_eq!(series.len(), 4);
+        assert_eq!(series[..2], [None, None]);
+        for n in series[2..].iter().flatten() {
+            assert!((13..=17).contains(n), "{series:?}");
+        }
+        assert!(series[2].is_some() && series[3].is_some());
+        assert_eq!(
+            w.production_series(Item::Glass, 2, 6),
+            vec![Some(0), Some(0)]
+        );
     }
 
     #[test]
