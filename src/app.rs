@@ -2,6 +2,7 @@
 
 use crate::game::Game;
 use crate::items::{Dir, EntityKind, Item};
+use crate::music::{Music, Status};
 use crate::recipes::{Category, RecipeId, TechId};
 use crate::records::{Placing, Records};
 use crate::scenario::{SCENARIOS, Scenario};
@@ -95,12 +96,13 @@ impl ConfirmAction {
     }
 }
 
-pub const MENU_ITEMS: [&str; 7] = [
+pub const MENU_ITEMS: [&str; 8] = [
     "Resume",
     "Save to slot…",
     "Load slot…",
     "Help",
     "Colours",
+    "Music",
     "Save & quit to title",
     "Quit without saving",
 ];
@@ -182,6 +184,9 @@ pub struct App {
     pub research_list: bool,
     /// Whether the last frame drew the research tree (it needs room), for arrow keys.
     pub tree_shown: Cell<bool>,
+    pub music: Music,
+    /// Whether the player has been told there is no sound device.
+    music_warned: bool,
 }
 
 impl App {
@@ -221,6 +226,8 @@ impl App {
             frame: 0,
             research_list: false,
             tree_shown: Cell::new(false),
+            music: Music::default(),
+            music_warned: false,
         }
     }
 
@@ -253,6 +260,8 @@ impl App {
         self.keymap = map;
         self.ascii |= s.ascii;
         crate::ui::set_colorblind(s.colorblind());
+        self.music.set_volume(s.music_volume);
+        self.music.set_on(s.music);
         if !problems.is_empty() {
             self.title_msg = Some(format!("settings.json: {}", problems.join("; ")));
         }
@@ -652,6 +661,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('n') => self.modal = Modal::NewGame { sel: 0 },
             KeyCode::Char('?') => self.modal = Modal::Help { scroll: 0 },
+            KeyCode::Char(c) if self.keymap.translate(c) == Some('J') => self.toggle_music(),
             KeyCode::Enter | KeyCode::Char(' ') => match items[self.title_sel.min(items.len() - 1)]
             {
                 "Continue" => {
@@ -1166,6 +1176,7 @@ impl App {
             KeyCode::Char('u') => self.undo_last(),
             KeyCode::Char('n') => self.next_alert(),
             KeyCode::Char('M') => self.modal = Modal::Minimap,
+            KeyCode::Char('J') => self.toggle_music(),
             KeyCode::Char(c @ '0'..='9') => {
                 let slot = if c == '0' {
                     9
@@ -1806,6 +1817,71 @@ impl App {
         }
     }
 
+    /// A message for the game log, or for the title screen when no game is loaded.
+    fn say(&mut self, msg: String) {
+        match self.game.as_mut() {
+            Some(g) => g.log(msg),
+            None => self.title_msg = Some(msg),
+        }
+    }
+
+    /// Turns the music on or off and remembers the choice.
+    pub fn toggle_music(&mut self) {
+        if !self.music.is_live() {
+            self.say("Music is off for this session (--no-music).".into());
+            return;
+        }
+        let on = !self.music.on();
+        self.music.set_on(on);
+        self.settings.music = on;
+        let key = self.key_for("music", 'J');
+        let msg = match self.settings.save(&self.settings_path()) {
+            Ok(()) if on && self.music.status() == Status::NoDevice => {
+                "Music on, but no sound device was found.".to_string()
+            }
+            Ok(()) if on => format!("♪ Music on ({key} turns it off, Esc menu sets the volume)."),
+            Ok(()) => format!("Music off ({key} turns it back on)."),
+            Err(e) => format!("Music switched, but settings.json couldn't be saved: {e}"),
+        };
+        self.say(msg);
+    }
+
+    /// Moves the music volume by `delta` percent and remembers it.
+    pub fn change_music_volume(&mut self, delta: i32) {
+        let v = (self.music.volume() as i32 + delta).clamp(0, 100) as u32;
+        self.music.set_volume(v);
+        self.settings.music_volume = v;
+        if !self.music.on() && v > 0 && self.music.is_live() {
+            self.music.set_on(true);
+            self.settings.music = true;
+        }
+        if let Err(e) = self.settings.save(&self.settings_path()) {
+            self.say(format!("Couldn't save settings.json: {e}"));
+        }
+    }
+
+    /// The key that does `action` now, after any remapping.
+    fn key_for(&self, action: &str, default: char) -> char {
+        self.settings
+            .keys
+            .get(action)
+            .and_then(|k| k.chars().next())
+            .unwrap_or(default)
+    }
+
+    /// Reports a new track in the log, and a missing sound device once. Called every frame.
+    pub fn poll_music(&mut self) {
+        if let Some(title) = self.music.take_now_playing()
+            && let Some(g) = self.game.as_mut()
+        {
+            g.log(format!("♪ Now playing: {title}"));
+        }
+        if !self.music_warned && self.music.on() && self.music.status() == Status::NoDevice {
+            self.music_warned = true;
+            self.say("No sound device found, so the music is silent.".into());
+        }
+    }
+
     fn menu_key(&mut self, k: KeyEvent, sel: usize) {
         let n = MENU_ITEMS.len();
         match k.code {
@@ -1818,13 +1894,20 @@ impl App {
                 self.modal = Modal::Menu { sel: (sel + 1) % n }
             }
             KeyCode::Esc => self.modal = Modal::None,
+            KeyCode::Left | KeyCode::Char('a') | KeyCode::Char('h') if sel == 5 => {
+                self.change_music_volume(-10)
+            }
+            KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('l') if sel == 5 => {
+                self.change_music_volume(10)
+            }
             KeyCode::Enter | KeyCode::Char(' ') => match sel {
                 0 => self.modal = Modal::None,
                 1 => self.open_slots(true),
                 2 => self.open_slots(false),
                 3 => self.modal = Modal::Help { scroll: 0 },
                 4 => self.toggle_palette(),
-                5 => {
+                5 => self.toggle_music(),
+                6 => {
                     self.save_game();
                     self.game = None;
                     self.modal = Modal::None;
@@ -1970,6 +2053,48 @@ mod tests {
         assert!(!a.settings.colorblind());
         let (s, _) = Settings::load_or_create(&a.settings_path());
         assert!(!s.colorblind());
+    }
+
+    #[test]
+    fn music_switch_and_volume_are_remembered() {
+        // Its own folder, so its settings.json doesn't race the palette test's.
+        let dir = std::env::temp_dir().join(format!("factuio-music-{}", std::process::id()));
+        let mut a = App::new(dir.join("save.json"), Some(5), false);
+        a.new_game();
+        // Without a live handle (as with --no-music) the switch only explains itself.
+        a.handle_key(key(KeyCode::Char('J')));
+        assert!(!a.music.on());
+        assert!(
+            a.game()
+                .messages
+                .last()
+                .unwrap()
+                .text
+                .contains("--no-music")
+        );
+
+        a.music = Music::live_without_sound();
+        a.handle_key(key(KeyCode::Char('J')));
+        assert!(a.music.on());
+        assert!(a.settings.music);
+        a.handle_key(key(KeyCode::Char('J')));
+        assert!(!a.music.on());
+        let (s, _) = Settings::load_or_create(&a.settings_path());
+        assert!(!s.music);
+
+        // In the pause menu, Music: right raises the volume (and switches the music on).
+        a.modal = Modal::Menu { sel: 5 };
+        a.handle_key(key(KeyCode::Right));
+        assert_eq!(a.music.volume(), 80);
+        assert!(a.music.on());
+        a.handle_key(key(KeyCode::Left));
+        a.handle_key(key(KeyCode::Left));
+        assert_eq!(a.music.volume(), 60);
+        let (s, _) = Settings::load_or_create(&a.settings_path());
+        assert_eq!((s.music, s.music_volume), (true, 60));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(!a.music.on());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

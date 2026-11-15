@@ -7,7 +7,8 @@
 Start with a handful of buildings on a procedurally generated map. Mine ore, smelt it,
 move it around on conveyors, arms and rail carts, explore beyond the fog, craft parts,
 research new technology, and finally build the **Uplink array** and feed it 20 relay modules
-to win. New to it? Pick **Tutorial** under New game.
+to win. New to it? Pick **Tutorial** under New game. An original soundtrack, synthesized live
+as you play, keeps you company (`J` turns it off).
 
 ![A mid-game factory: conveyor lines feeding fabricators that make cogs and coils](docs/screenshot-factory.png)
 
@@ -34,6 +35,9 @@ Options:
 --ascii           ASCII-only glyphs (for terminals without Unicode arrows)
 --256             force 256-colour mode (macOS Terminal.app, older terminals)
 --truecolor       force 24-bit colour
+--no-music        keep the music off this session
+--export-music <DIR>
+                  write the soundtrack to DIR as WAV files and exit
 ```
 
 A terminal of at least 100×30 is recommended. Colours are 24-bit when your terminal
@@ -74,8 +78,9 @@ advertises it through `COLORTERM`; otherwise they fall back to the 256-colour pa
 | M | Map overview |
 | o | Power coverage overlay |
 | p / f | Pause / 4× fast-forward |
+| J | Music on or off (volume: ←/→ on Music in the Esc menu) |
 | F5 / F9 | Quick save / quick load the current slot (asks first) |
-| Esc | Menu (save to or load one of 5 slots, colour-blind palette, quit) |
+| Esc | Menu (save to or load one of 5 slots, colour-blind palette, music, quit) |
 | ? | Help |
 
 **Mouse:** left click places or inspects, left drag lays buildings along the path (or selects an
@@ -110,6 +115,8 @@ to a separate `save.autosave.json`, so it never overwrites a save you made yours
   "palette": "default",
   "ascii": false,
   "autosave_minutes": 5,
+  "music": true,
+  "music_volume": 70,
   "keys": { "mine": "k" }
 }
 ```
@@ -118,8 +125,30 @@ to a separate `save.autosave.json`, so it never overwrites a save you made yours
 problems, datapacks) for blue/orange ones; the pause menu switches it too. `keys` remaps
 play-screen actions: `rotate`, `paint`, `pick`, `remove`, `inspect`, `mine`,
 `build_menu`, `craft`, `research`, `stats`, `log`, `power_overlay`, `pause`, `fast`,
-`select_area`, `undo`, `next_alert`, `minimap`. Set `autosave_minutes` to 0 to turn autosave
-off, and `mouse` to false to keep your terminal's own text selection.
+`select_area`, `undo`, `next_alert`, `minimap`, `music`. Set `autosave_minutes` to 0 to turn
+autosave off, and `mouse` to false to keep your terminal's own text selection. `music` and
+`music_volume` (0 to 100) are what `J` and the pause menu change.
+
+### Music
+
+The game plays six original pieces, about 13 minutes in all, one after another:
+
+| Track | Mood |
+| --- | --- |
+| Morning Shift | Harp, flute and celesta on a bright morning, F major |
+| Ore and Ember | Slow, spacious piano under the stars, D major |
+| Conveyor Waltz | A waltz for strings, flute and piano, A minor with a C major middle |
+| Night Grid | Night shift: pulsing sequencer, drums and a slow synth melody, E minor |
+| Kingdom of Cogs | A modal folk march for recorder, lute and drum, D Dorian |
+| Terminal Dreams | Chiptune: square lead, fast arpeggios and noise drums, C minor |
+
+Nothing is a recording. The notes are written in `src/music/score.rs` and played by a small
+synthesizer (`src/music/synth.rs`: plucked strings, FM bells, a piano, bowed strings, chip
+waves, drums, and a reverb) on its own thread. On Linux the game loads ALSA when the music
+starts, so it still runs, silently, where there is no sound system (over SSH, for example).
+macOS and Windows use the system's default output.
+
+The same tracks, rendered, are in [`music/`](music/) as OGG and MP3 files.
 
 ## How it plays
 
@@ -240,6 +269,7 @@ Code layout:
 - `src/records.rs`: best times
 - `src/app.rs`: screens and keyboard handling
 - `src/ui.rs`: ratatui rendering
+- `src/music/`: the soundtrack: score, synthesizer, and sound output
 - `src/playtest.rs`: scripted playthroughs used by the tests
 
 The simulation runs at 20 ticks per second and is deterministic for a given seed.

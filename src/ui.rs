@@ -1137,8 +1137,11 @@ fn draw_title(f: &mut Frame, app: &App) {
         app.save_path.display()
     ))));
     lines.push(Line::from(dim(
-        "↑/↓ choose · Enter select · n new game or challenge · q quit",
+        "↑/↓ choose · Enter select · n new game or challenge · J music · q quit",
     )));
+    if let Some(t) = app.music.now_playing() {
+        lines.push(Line::from(dim(format!("♪ {t}"))));
+    }
     let h = lines.len() as u16;
     let y = area.height.saturating_sub(h) / 2;
     let r = Rect::new(area.x, area.y + y, area.width, h.min(area.height));
@@ -1172,7 +1175,7 @@ fn draw_game(f: &mut Frame, app: &App, game: &Game) {
         Modal::Build { sel } => draw_build(f, app, game, *sel),
         Modal::Research { sel } => draw_research(f, app, game, *sel),
         Modal::Entity { x, y, sub, sel } => draw_entity_panel(f, app, game, *x, *y, sub, *sel),
-        Modal::Menu { sel } => draw_menu(f, *sel),
+        Modal::Menu { sel } => draw_menu(f, app, *sel),
         Modal::Stats => draw_stats(f, app, game),
         Modal::Victory => draw_victory(f, app, game),
         Modal::Log { scroll } => draw_log(f, game, *scroll),
@@ -2720,8 +2723,22 @@ fn draw_entity_panel(
     f.render_widget(Paragraph::new(r), right);
 }
 
-fn draw_menu(f: &mut Frame, sel: usize) {
-    let area = centered(f.area(), 38, MENU_ITEMS.len() as u16 + 4);
+/// The music's state for the pause menu.
+fn music_label(app: &App) -> String {
+    let m = &app.music;
+    if !m.is_live() {
+        "off this session".into()
+    } else if !m.on() {
+        "off".into()
+    } else if m.status() == crate::music::Status::NoDevice {
+        "no sound device".into()
+    } else {
+        format!("on, {}%", m.volume())
+    }
+}
+
+fn draw_menu(f: &mut Frame, app: &App, sel: usize) {
+    let area = centered(f.area(), 42, MENU_ITEMS.len() as u16 + 5);
     f.render_widget(Clear, area);
     let block = modal_block("Paused");
     let inner = block.inner(area);
@@ -2737,12 +2754,20 @@ fn draw_menu(f: &mut Frame, sel: usize) {
                     "normal"
                 };
                 format!("  Colours: {which}")
+            } else if *m == "Music" {
+                let hint = if k == sel { "  ←/→ volume" } else { "" };
+                format!("  Music: {}{hint}", music_label(app))
             } else {
                 format!("  {m}")
             };
             list_line(vec![Span::raw(label)], k == sel)
         })
         .collect();
+    let mut rows = rows;
+    if let Some(t) = app.music.now_playing() {
+        rows.push(Line::from(""));
+        rows.push(Line::from(dim(format!("  ♪ {t}"))));
+    }
     f.render_widget(
         Paragraph::new(rows),
         inner.inner(ratatui::layout::Margin::new(0, 1)),
@@ -3214,8 +3239,10 @@ INTERACTING
 
 GAME
   p pause   f fast-forward (4x)   F5 quick save   F9 quick load
+  J        music on or off (Shift+j); ←/→ on Music in the Esc menu
+           sets the volume. Six original pieces, about 13 minutes.
   Esc menu: save to or load any of 5 slots, switch to colour-blind
-  safe colours, quit. F5/F9 use the slot
+  safe colours, music, quit. F5/F9 use the slot
   you last saved to or loaded. The game autosaves every 5 minutes, and
   when you press Ctrl+C or close the terminal, to a separate autosave
   file; Continue picks whichever save is newest.
@@ -3227,7 +3254,8 @@ SETTINGS
   "keys": {"mine": "k", "undo": "U"}. Remappable actions: rotate,
   paint, pick, remove, inspect, mine, build_menu, craft, research,
   stats, log, power_overlay, pause, fast, select_area, undo,
-  next_alert, minimap.
+  next_alert, minimap, music. "music": false starts with the music
+  off, and "music_volume" sets its level (0-100).
 
 MAP LEGEND
   ▪ ◆ ● ✦    ore: ferrite (blue ▪), malachite (green ◆), lignite (grey ●),

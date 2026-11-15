@@ -24,6 +24,7 @@ pub const ACTIONS: &[(&str, char)] = &[
     ("undo", 'u'),
     ("next_alert", 'n'),
     ("minimap", 'M'),
+    ("music", 'J'),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -36,6 +37,9 @@ pub struct Settings {
     /// ASCII-only glyphs (same as --ascii).
     pub ascii: bool,
     pub autosave_minutes: u64,
+    /// Background music on or off, and its volume from 0 to 100.
+    pub music: bool,
+    pub music_volume: u32,
     /// Action name → key, e.g. {"mine": "n"}. Only listed actions change.
     pub keys: BTreeMap<String, String>,
 }
@@ -47,6 +51,8 @@ impl Default for Settings {
             palette: "default".into(),
             ascii: false,
             autosave_minutes: 5,
+            music: true,
+            music_volume: 70,
             keys: BTreeMap::new(),
         }
     }
@@ -174,5 +180,7 @@ mod tests {
         let s: Settings = serde_json::from_str(r#"{"mouse": false}"#).unwrap();
         assert!(!s.mouse);
         assert_eq!(s.autosave_minutes, 5);
+        assert!(s.music);
+        assert_eq!(s.music_volume, 70);
     }
 }

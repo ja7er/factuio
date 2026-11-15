@@ -1,0 +1,47 @@
+{
+  "album": "factuio",
+  "tracks": [
+    {
+      "title": "Morning Shift",
+      "description": "Harp, flute and celesta on a bright morning",
+      "seconds": 124.0,
+      "ogg": "01-morning-shift.ogg",
+      "mp3": "01-morning-shift.mp3"
+    },
+    {
+      "title": "Ore and Ember",
+      "description": "Slow, spacious piano under the stars",
+      "seconds": 129.1,
+      "ogg": "02-ore-and-ember.ogg",
+      "mp3": "02-ore-and-ember.mp3"
+    },
+    {
+      "title": "Conveyor Waltz",
+      "description": "A waltz for strings, flute and piano",
+      "seconds": 121.5,
+      "ogg": "03-conveyor-waltz.ogg",
+      "mp3": "03-conveyor-waltz.mp3"
+    },
+    {
+      "title": "Night Grid",
+      "description": "Night shift: pulsing sequencer, drums and a slow synth melody",
+      "seconds": 137.2,
+      "ogg": "04-night-grid.ogg",
+      "mp3": "04-night-grid.mp3"
+    },
+    {
+      "title": "Kingdom of Cogs",
+      "description": "A modal folk march for recorder, lute and drum",
+      "seconds": 130.9,
+      "ogg": "05-kingdom-of-cogs.ogg",
+      "mp3": "05-kingdom-of-cogs.mp3"
+    },
+    {
+      "title": "Terminal Dreams",
+      "description": "Chiptune: square lead, fast arpeggios and noise drums",
+      "seconds": 130.6,
+      "ogg": "06-terminal-dreams.ogg",
+      "mp3": "06-terminal-dreams.mp3"
+    }
+  ]
+}
