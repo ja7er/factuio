@@ -52,7 +52,7 @@ advertises it through `COLORTERM`; otherwise they fall back to the 256-colour pa
 | ![Crafting and inventory](docs/screenshot-craft.png) | ![Research tree](docs/screenshot-research.png) |
 | Hand crafting, with missing intermediates made automatically | The research tree |
 | ![Inspecting a fabricator](docs/screenshot-entity.png) | ![Production statistics](docs/screenshot-stats.png) |
-| Inspecting a fabricator | Production statistics and power grids |
+| Inspecting a fabricator | Production statistics, with the last ten minutes of each item |
 
 ## Controls
 

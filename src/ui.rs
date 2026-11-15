@@ -3766,6 +3766,44 @@ mod tests {
                     t.draw(|f| draw(f, &b)).unwrap();
                 }
                 Some(m) => {
+                    if name == "stats" {
+                        // Run on to midday of the third day, as a player tending the factory
+                        // would: fuel topped up, crates emptied, the fabricator lines' ingot
+                        // crates refilled. Then every sparkline has ten minutes.
+                        let g = a.game.as_mut().unwrap();
+                        while g.world.tick < 15 * 60 * crate::world::TICKS_PER_SEC as u64 {
+                            let width = g.world.width as usize;
+                            for i in 0..g.world.entities.len() {
+                                let Some(kind) = g.world.entities[i].as_ref().map(|e| e.kind)
+                                else {
+                                    continue;
+                                };
+                                use crate::items::EntityKind as K;
+                                if kind.fuel_draw() > 0.0 || kind == K::Generator {
+                                    g.world.insert(i, Item::Lignite, 10, true);
+                                }
+                                if kind == K::Crate {
+                                    let had = |item| match &g.world.entities[i] {
+                                        Some(Entity {
+                                            state: State::Chest { inv, .. },
+                                            ..
+                                        }) => inv.count(item) > 0,
+                                        _ => false,
+                                    };
+                                    // The two crates that feed the lines are the ones holding
+                                    // ingots and nothing made from them.
+                                    let source = [Item::IronIngot, Item::CopperIngot]
+                                        .into_iter()
+                                        .find(|&it| had(it) && !had(Item::Cog) && !had(Item::Coil));
+                                    g.take_output((i % width) as i32, (i / width) as i32);
+                                    if let Some(it) = source {
+                                        g.world.insert(i, it, 400, true);
+                                    }
+                                }
+                            }
+                            crate::playtest::run(g, 30);
+                        }
+                    }
                     a.modal = m;
                     let g = a.game.as_mut().unwrap();
                     g.player.cursor = if name == "map" { kiln } else { (x, y) };
