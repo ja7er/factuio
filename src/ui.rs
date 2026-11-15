@@ -32,6 +32,44 @@ pub fn set_truecolor(on: bool) {
     TRUECOLOR.store(on, Ordering::Relaxed);
 }
 
+static COLORBLIND: AtomicBool = AtomicBool::new(false);
+
+/// Swaps the red/green signals for blue/orange ones (settings `palette`, or the pause menu).
+pub fn set_colorblind(on: bool) {
+    COLORBLIND.store(on, Ordering::Relaxed);
+}
+
+fn colorblind() -> bool {
+    COLORBLIND.load(Ordering::Relaxed)
+}
+
+/// Things going well: working, researched, enough power.
+fn good() -> Rgb {
+    if colorblind() {
+        (90, 180, 255)
+    } else {
+        (120, 230, 120)
+    }
+}
+
+/// Problems: stopped machines, missing fuel or power.
+fn bad() -> Rgb {
+    if colorblind() {
+        (245, 130, 30)
+    } else {
+        (255, 100, 100)
+    }
+}
+
+/// Highlights a miner's drop tile, an arm's pickup tile and a tunnel's other end.
+fn source_tint() -> Rgb {
+    if colorblind() {
+        (80, 170, 255)
+    } else {
+        (80, 255, 120)
+    }
+}
+
 type Rgb = (u8, u8, u8);
 
 fn col((r, g, b): Rgb) -> Color {
@@ -79,6 +117,17 @@ fn blend(a: Rgb, b: Rgb, t: f32) -> Rgb {
 }
 
 pub fn item_rgb(item: Item) -> Rgb {
+    if colorblind() {
+        // Okabe-Ito hues for the pairs that otherwise differ only by red and green.
+        match item {
+            Item::AlphaPack => return (230, 159, 0),
+            Item::BetaPack => return (86, 180, 233),
+            Item::GammaPack => return (204, 121, 167),
+            Item::Chip => return (0, 190, 140),
+            Item::Motor => return (225, 110, 30),
+            _ => {}
+        }
+    }
     match item {
         Item::FerriteOre => (150, 170, 210),
         Item::MalachiteOre => (80, 210, 140),
@@ -164,16 +213,16 @@ fn status_rgb(s: Status) -> Rgb {
     match s {
         Status::Working => (250, 250, 250),
         Status::LowPower => (250, 220, 80),
-        s if s.is_problem() => (255, 90, 90),
+        s if s.is_problem() => bad(),
         _ => (170, 170, 170),
     }
 }
 
 fn status_color(s: Status) -> Color {
     match s {
-        Status::Working => col((120, 230, 120)),
+        Status::Working => col(good()),
         Status::LowPower | Status::NoInput => col((240, 210, 90)),
-        s if s.is_problem() => col((255, 100, 100)),
+        s if s.is_problem() => col(bad()),
         _ => col((170, 170, 170)),
     }
 }
@@ -251,7 +300,7 @@ fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32, tick: 
             };
             // Each special piece keeps one half for its own mark and carries items in the other.
             let mark_fg = if e.status.is_problem() {
-                (255, 90, 90)
+                bad()
             } else {
                 (235, 225, 170)
             };
@@ -278,18 +327,31 @@ fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32, tick: 
             }
             out
         }
-        State::Arm { hand, .. } => {
+        State::Arm { hand, phase, t, .. } => {
             let base = arm_rgb(e.kind);
-            let fg = if e.status.is_problem() {
-                (255, 90, 90)
-            } else {
-                base
-            };
-            let first = match hand {
+            let fg = if e.status.is_problem() { bad() } else { base };
+            let held = match hand {
                 Some(i) => (i.glyph(), item_rgb(*i), bg, true),
                 None => (if ascii { 'a' } else { 'ɑ' }, fg, bg, true),
             };
-            [first, (e.dir.arrow(ascii), fg, bg, true)]
+            let arrow = (e.dir.arrow(ascii), fg, bg, true);
+            // On east and west arms the hand visibly swings across the tile: it starts at the
+            // back half, crosses to the front half midway, and comes back empty.
+            let front = match phase {
+                ArmPhase::Swing => *t >= 0.5,
+                ArmPhase::Return => *t < 0.5,
+                ArmPhase::Pickup => false,
+            };
+            let hand_right = match e.dir {
+                Dir::East => front,
+                Dir::West => !front,
+                _ => false,
+            };
+            if hand_right {
+                [arrow, held]
+            } else {
+                [held, arrow]
+            }
         }
         State::Miner { .. } => [
             letter(match e.kind {
@@ -311,10 +373,23 @@ fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32, tick: 
                 (None, Some(o)) => (o.glyph(), item_rgb(o), bg, false),
                 _ => (dot, dim, bg, false),
             };
-            [
+            let mut cells = [
                 letter(if e.kind == EntityKind::Kiln { 'K' } else { 'E' }),
                 second,
-            ]
+            ];
+            if e.status == Status::Working {
+                // The fire glows brighter and dimmer.
+                let phase = (tick % 40) as f32 / 40.0 * std::f32::consts::TAU;
+                let glow = if e.kind == EntityKind::Kiln {
+                    (220, 110, 40)
+                } else {
+                    (200, 90, 220)
+                };
+                for c in &mut cells {
+                    c.2 = blend(bg, glow, 0.12 + 0.1 * phase.sin());
+                }
+            }
+            cells
         }
         State::Assembler { recipe, .. } => {
             let second = match recipe {
@@ -324,7 +399,7 @@ fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32, tick: 
                     bg,
                     true,
                 ),
-                None => ('?', (255, 120, 120), bg, true),
+                None => ('?', bad(), bg, true),
             };
             [
                 letter(if e.kind == EntityKind::ChemPlant {
@@ -339,7 +414,7 @@ fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32, tick: 
             let (c, fg) = if *unload {
                 ('-', (255, 170, 110))
             } else {
-                ('+', (140, 230, 140))
+                ('+', good())
             };
             [('R', (230, 210, 255), bg, true), (c, fg, bg, true)]
         }
@@ -365,17 +440,32 @@ fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32, tick: 
             [letter('V'), second]
         }
         State::Generator { .. } => {
-            let s = match e.status {
-                Status::Working => '~',
-                Status::NoFuel | Status::NoWater => '!',
-                _ => dot,
-            };
             let l = if e.kind == EntityKind::SteamTurbine {
                 'T'
             } else {
                 'G'
             };
-            [letter(l), (s, st, bg, true)]
+            let second = match e.status {
+                Status::Working => {
+                    // A flame that flickers between two shapes and shades.
+                    let flick = ((tick / 3).wrapping_mul(0x9E37_79B9) >> 7) & 3;
+                    let c = match (flick, ascii) {
+                        (0, false) => '≈',
+                        (0, true) => '=',
+                        _ => '~',
+                    };
+                    let fg = [
+                        (255, 210, 90),
+                        (255, 170, 60),
+                        (255, 230, 140),
+                        (250, 190, 70),
+                    ][flick as usize];
+                    (c, fg, bg, true)
+                }
+                Status::NoFuel | Status::NoWater => ('!', st, bg, true),
+                _ => (dot, st, bg, true),
+            };
+            [letter(l), second]
         }
         State::Battery { charge } => {
             let f = (charge / crate::world::BANK_CAPACITY).clamp(0.0, 1.0);
@@ -492,6 +582,8 @@ impl Widget for MapView<'_> {
             .app
             .area_anchor
             .map(|a| crate::tools::rect(a, (cx, cy)));
+        // Problem markers blink, even while paused.
+        let blink_on = (self.app.frame / 8).is_multiple_of(2);
 
         for sy in 0..vh {
             for sx in 0..vw {
@@ -548,8 +640,16 @@ impl Widget for MapView<'_> {
                     }
                 };
 
+                // Neighbouring machines don't animate in step.
+                let anim = world.tick + ((x * 7 + y * 13).rem_euclid(32)) as u64;
                 if let Some(e) = world.entity(x, y) {
-                    cells = entity_cells(e, ascii, bg, world.transmitted, world.tick);
+                    cells = entity_cells(e, ascii, bg, world.transmitted, anim);
+                    if blink_on
+                        && e.status.is_problem()
+                        && !matches!(e.state, State::Belt { .. } | State::Rail)
+                    {
+                        cells[1] = ('!', bad(), cells[1].2, true);
+                    }
                     if e.kind == EntityKind::Rail {
                         let mut mask = 0;
                         for (bit, (dx, dy)) in
@@ -565,6 +665,26 @@ impl Widget for MapView<'_> {
                         cells = rail_cells(mask, ascii, cells[0].2);
                     }
                     bg = cells[0].2;
+                } else if explored
+                    && tile.terrain != Terrain::Water
+                    && let Some(below) = world.entity(x, y + 1)
+                    && below.status == Status::Working
+                    && matches!(
+                        below.kind,
+                        EntityKind::Kiln | EntityKind::Generator | EntityKind::SteamTurbine
+                    )
+                {
+                    // Smoke (or steam) rises from the fire below and fades.
+                    let p = (anim / 5) % 12;
+                    if p < 6 {
+                        let puffs = if ascii {
+                            ['.', 'o', '\'']
+                        } else {
+                            ['.', '∘', '°']
+                        };
+                        let fg = blend((175, 175, 180), bg, p as f32 / 8.0);
+                        cells[(p / 3) as usize] = (puffs[(p / 2) as usize], fg, bg, false);
+                    }
                 }
                 if let Some(c) = world.idx(x, y).and_then(|i| carts.get(&i)) {
                     cells = cart_cells(c, ascii, bg);
@@ -598,19 +718,19 @@ impl Widget for MapView<'_> {
                     let (dx, dy) = d.delta();
                     // Miners drop into the tile right in front of them.
                     if k.is_miner() && (x, y) == (cx + dx, cy + dy) {
-                        tint = Some(((80, 255, 120), 0.3));
+                        tint = Some((source_tint(), 0.3));
                     }
                     if k.is_arm() {
                         let n = k.arm_reach();
                         if (x, y) == (cx - dx * n, cy - dy * n) {
-                            tint = Some(((80, 255, 120), 0.35));
+                            tint = Some((source_tint(), 0.35));
                         } else if (x, y) == (cx + dx * n, cy + dy * n) {
                             tint = Some(((255, 150, 60), 0.4));
                         }
                     }
                     if k.is_tunnel() {
                         if tunnel_mate == Some((x, y)) {
-                            tint = Some(((80, 255, 120), 0.4));
+                            tint = Some((source_tint(), 0.4));
                         } else if tunnel_mate.is_none()
                             && k == EntityKind::TunnelIn
                             && (1..=TUNNEL_REACH).any(|n| (x, y) == (cx + dx * n, cy + dy * n))
@@ -936,7 +1056,7 @@ fn draw_title(f: &mut Frame, app: &App) {
     if let Some(m) = &app.title_msg {
         lines.push(Line::from(Span::styled(
             m.clone(),
-            Style::default().fg(col((255, 100, 100))),
+            Style::default().fg(col(bad())),
         )));
     }
     lines.push(Line::from(dim(format!(
@@ -980,7 +1100,7 @@ fn draw_game(f: &mut Frame, app: &App, game: &Game) {
         Modal::Research { sel } => draw_research(f, app, game, *sel),
         Modal::Entity { x, y, sub, sel } => draw_entity_panel(f, app, game, *x, *y, sub, *sel),
         Modal::Menu { sel } => draw_menu(f, *sel),
-        Modal::Stats => draw_stats(f, game),
+        Modal::Stats => draw_stats(f, app, game),
         Modal::Victory => draw_victory(f, app, game),
         Modal::Log { scroll } => draw_log(f, game, *scroll),
         Modal::Confirm { action } => draw_confirm(f, action.question()),
@@ -1007,6 +1127,60 @@ fn time_of_day(light: f32, ascii: bool) -> Span<'static> {
         (if ascii { "~" } else { "◐" }, "dusk", (240, 160, 110))
     };
     Span::styled(format!("{sym} {word}"), Style::default().fg(col(c)))
+}
+
+/// kW, or MW once it's big.
+fn fmt_power(kw: f32) -> String {
+    if kw >= 10_000.0 {
+        format!("{:.0} MW", kw / 1000.0)
+    } else if kw >= 1000.0 {
+        format!("{:.1} MW", kw / 1000.0)
+    } else {
+        format!("{kw:.0} kW")
+    }
+}
+
+/// Demand against supply over every power network, coloured by the worst-off one.
+fn power_summary(w: &crate::world::World, ascii: bool) -> Option<Span<'static>> {
+    let nets: Vec<_> = w
+        .nets
+        .iter()
+        .filter(|n| n.capacity > 0.0 || n.demand_prev > 0.0)
+        .collect();
+    if nets.is_empty() {
+        return None;
+    }
+    let demand: f32 = nets.iter().map(|n| n.demand_prev).sum();
+    let capacity: f32 = nets.iter().map(|n| n.capacity).sum();
+    let worst = nets
+        .iter()
+        .filter(|n| n.demand_prev > 0.0)
+        .map(|n| n.satisfaction)
+        .fold(1.0f32, f32::min);
+    let c = if worst >= 0.999 {
+        good()
+    } else if worst >= 0.5 {
+        (240, 210, 90)
+    } else {
+        bad()
+    };
+    let mut text = format!(
+        "{} {}/{}",
+        if ascii { "Pwr" } else { "⚡" },
+        fmt_power(demand),
+        fmt_power(capacity)
+    );
+    let (stored, storage): (f32, f32) = nets
+        .iter()
+        .fold((0.0, 0.0), |(a, b), n| (a + n.stored, b + n.storage));
+    if storage > 0.0 {
+        text.push_str(&format!(
+            " {}{:.0}%",
+            if ascii { "bat " } else { "▮" },
+            stored / storage * 100.0
+        ));
+    }
+    Some(Span::styled(text, Style::default().fg(col(c))))
 }
 
 fn draw_top(f: &mut Frame, app: &App, game: &Game, area: Rect) {
@@ -1055,6 +1229,10 @@ fn draw_top(f: &mut Frame, app: &App, game: &Game, area: Rect) {
     } else {
         spans.push(dim("▶ 1x"));
     }
+    if let Some(p) = power_summary(&game.world, app.ascii) {
+        spans.push(Span::raw("  "));
+        spans.push(p);
+    }
     spans.push(Span::raw("   "));
     let r = &game.world.research;
     match r.current {
@@ -1076,7 +1254,7 @@ fn draw_top(f: &mut Frame, app: &App, game: &Game, area: Rect) {
         }
         None if r.all_done() => spans.push(Span::styled(
             "All research complete",
-            Style::default().fg(col((120, 230, 120))),
+            Style::default().fg(col(good())),
         )),
         None => spans.push(Span::styled(
             "No research — press t",
@@ -1094,7 +1272,7 @@ fn draw_top(f: &mut Frame, app: &App, game: &Game, area: Rect) {
     if app.paint {
         spans.push(Span::styled(
             "   PAINT",
-            Style::default().fg(Color::Black).bg(col((120, 230, 120))),
+            Style::default().fg(Color::Black).bg(col(good())),
         ));
     }
     f.render_widget(
@@ -1107,7 +1285,7 @@ fn fuel_line(fuel: &crate::world::Fuel) -> Line<'static> {
     let c = if fuel.has() {
         col((220, 220, 220))
     } else {
-        col((255, 100, 100))
+        col(bad())
     };
     Line::from(vec![
         Span::raw("Fuel: "),
@@ -1168,7 +1346,7 @@ fn entity_detail(
             ))),
             None => lines.push(Line::from(Span::styled(
                 "Not on a pylon network",
-                Style::default().fg(col((255, 100, 100))),
+                Style::default().fg(col(bad())),
             ))),
         }
         if let Some(n) = w.net_at(i)
@@ -1207,7 +1385,7 @@ fn entity_detail(
                     }
                     None => Line::from(Span::styled(
                         "Not linked: needs the other end ahead, facing the same way",
-                        Style::default().fg(col((255, 100, 100))),
+                        Style::default().fg(col(bad())),
                     )),
                 });
             }
@@ -1333,7 +1511,7 @@ fn entity_detail(
                 }
                 None => lines.push(Line::from(Span::styled(
                     "No recipe: e then r",
-                    Style::default().fg(col((255, 120, 120))),
+                    Style::default().fg(col(bad())),
                 ))),
             }
             lines.push(Line::from("Output:"));
@@ -1521,9 +1699,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("Alerts ({})", problems.len()),
-                Style::default()
-                    .fg(col((255, 110, 110)))
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(col(bad())).add_modifier(Modifier::BOLD),
             ),
             dim("  n: next"),
         ]));
@@ -1817,7 +1993,7 @@ fn draw_craft(f: &mut Frame, app: &App, game: &Game, sel: usize) {
                             n.to_string()
                         }
                     ),
-                    Style::default().fg(col((120, 230, 120))),
+                    Style::default().fg(col(good())),
                 )
             };
             list_line(vec![Span::raw(" "), name, cnt], k == sel)
@@ -2000,71 +2176,57 @@ fn draw_build(f: &mut Frame, game: &Game, sel: usize) {
     );
 }
 
-fn draw_research(f: &mut Frame, app: &App, game: &Game, sel: usize) {
-    let area = centered(f.area(), 90, 24);
-    f.render_widget(Clear, area);
-    let block = modal_block("Research");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let [left, right] =
-        Layout::horizontal([Constraint::Length(30), Constraint::Min(20)]).areas(inner);
+/// The mark and colour a tech shows in the research list and tree.
+fn tech_mark(r: &crate::research::Research, t: TechId, ascii: bool) -> (String, Color) {
+    if r.current == Some(t) {
+        (">".to_string(), col((120, 220, 255)))
+    } else if let Some(q) = r.queue.iter().position(|&q| q == t) {
+        (format!("{}", (q + 1) % 10), col((180, 200, 255)))
+    } else if t.get().repeatable && r.is_available(t) {
+        (
+            if ascii { "*" } else { "∞" }.to_string(),
+            col((240, 200, 255)),
+        )
+    } else if r.is_done(t) {
+        (if ascii { "+" } else { "✓" }.to_string(), col(good()))
+    } else if r.is_available(t) {
+        ("o".to_string(), col((240, 240, 240)))
+    } else {
+        ("x".to_string(), col((110, 110, 110)))
+    }
+}
+
+/// What the research screens say about tech `t`: facts first, then what Enter would do.
+fn research_details(app: &App, game: &Game, t: TechId) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let r = &game.world.research;
-    let rows: Vec<Line> = TechId::all()
-        .enumerate()
-        .map(|(k, t)| {
-            let queued = r.queue.iter().position(|&q| q == t);
-            let (mark, c) = if r.current == Some(t) {
-                (">".to_string(), col((120, 220, 255)))
-            } else if let Some(q) = queued {
-                (format!("{}", q + 1), col((180, 200, 255)))
-            } else if t.get().repeatable && r.is_available(t) {
-                (
-                    if app.ascii { "*" } else { "∞" }.to_string(),
-                    col((240, 200, 255)),
-                )
-            } else if r.is_done(t) {
-                (
-                    if app.ascii { "+" } else { "✓" }.to_string(),
-                    col((120, 230, 120)),
-                )
-            } else if r.is_available(t) {
-                ("o".to_string(), col((240, 240, 240)))
-            } else {
-                ("x".to_string(), col((110, 110, 110)))
-            };
-            list_line(
-                vec![Span::styled(
-                    format!(" {mark:>1} {:<24}", tech_label(r, t)),
-                    Style::default().fg(c),
-                )],
-                k == sel,
-            )
-        })
-        .collect();
-    f.render_widget(
-        Paragraph::new(rows).scroll((scroll_for(sel, left.height), 0)),
-        left,
-    );
-    let t = TechId(sel as u16);
     let tech = t.get();
     let label = tech_label(r, t);
-    let mut lines = vec![header(&label), Line::from(tech.desc), Line::from("")];
+    let mut info = vec![
+        Line::from(Span::styled(
+            label,
+            Style::default()
+                .fg(col((255, 220, 140)))
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(tech.desc),
+        Line::from(""),
+    ];
     let packs = tech
         .packs
         .iter()
         .map(|p| p.name())
         .collect::<Vec<_>>()
         .join(" + ");
-    lines.push(Line::from(format!(
+    info.push(Line::from(format!(
         "Cost: {} units of {}",
         r.units_needed(t),
         packs
     )));
-    lines.push(Line::from(format!(
+    info.push(Line::from(format!(
         "{:.0}s per unit per lab",
         tech.unit_time
     )));
-    lines.push(Line::from(format!(
+    info.push(Line::from(format!(
         "Progress: {} {}/{}",
         bar(r.fraction(t), 16, app.ascii),
         r.units_done(t),
@@ -2077,20 +2239,27 @@ fn draw_research(f: &mut Frame, app: &App, game: &Game, sel: usize) {
             .filter_map(|p| TechId::by_id(p))
             .map(|p| p.get().name)
             .collect();
-        lines.push(Line::from(format!("Requires: {}", names.join(", "))));
+        info.push(Line::from(format!("Requires: {}", names.join(", "))));
     }
-    lines.push(Line::from("Unlocks:"));
+    let next: Vec<_> = crate::research::leads_to(t)
+        .into_iter()
+        .map(|u| u.get().name)
+        .collect();
+    if !next.is_empty() {
+        info.push(Line::from(dim(format!("Leads to: {}", next.join(", ")))));
+    }
+    let mut act = vec![Line::from("Unlocks:")];
     for u in tech.unlocks {
         if let Some(rid) = crate::recipes::RecipeId::by_id(u) {
-            lines.push(Line::from(vec![
+            act.push(Line::from(vec![
                 Span::raw("  • "),
                 item_span(rid.get().main_output()),
             ]));
         }
     }
-    lines.push(Line::from(""));
+    act.push(Line::from(""));
     let status = if r.is_done(t) && !tech.repeatable {
-        Span::styled("Researched", Style::default().fg(col((120, 230, 120))))
+        Span::styled("Researched", Style::default().fg(col(good())))
     } else if r.current == Some(t) {
         Span::styled(
             "In progress: feed labs with datapacks",
@@ -2116,22 +2285,186 @@ fn draw_research(f: &mut Frame, app: &App, game: &Game, sel: usize) {
             Style::default().fg(col((255, 160, 110))),
         )
     };
-    lines.push(Line::from(status));
+    act.push(Line::from(status));
     if !r.queue.is_empty() {
         let names: Vec<_> = r.queue.iter().map(|q| q.get().name).collect();
-        lines.push(Line::from(dim(format!("Queue: {}", names.join(" → ")))));
+        act.push(Line::from(dim(format!("Queue: {}", names.join(" → ")))));
     }
-    lines.push(Line::from(vec![
+    (info, act)
+}
+
+fn research_keys(tree: bool) -> Line<'static> {
+    Line::from(vec![
         key("Enter"),
         dim(" research/queue  "),
         key("n"),
         dim(" switch now  "),
         key("x"),
-        dim(" clear queue"),
-    ]));
+        dim(" clear queue  "),
+        key("Tab"),
+        dim(if tree { " list view" } else { " tree view" }),
+    ])
+}
+
+fn draw_research(f: &mut Frame, app: &App, game: &Game, sel: usize) {
+    let full = f.area();
+    let tiers = crate::research::tech_tiers();
+    let rows = tiers.iter().map(|c| c.len()).max().unwrap_or(1) as u16;
+    // The tree needs a wide, tall screen: one column per tier and three lines per tech.
+    let tree_h = rows * 3 + 1;
+    let tree = !app.research_list && full.width >= 100 && full.height >= tree_h + 14;
+    app.tree_shown.set(tree);
+    if tree {
+        draw_research_tree(f, app, game, sel, &tiers, tree_h);
+        return;
+    }
+    let area = centered(full, 90, 24);
+    f.render_widget(Clear, area);
+    let block = modal_block("Research");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [left, right] =
+        Layout::horizontal([Constraint::Length(30), Constraint::Min(20)]).areas(inner);
+    let r = &game.world.research;
+    let rows: Vec<Line> = TechId::all()
+        .enumerate()
+        .map(|(k, t)| {
+            let (mark, c) = tech_mark(r, t, app.ascii);
+            list_line(
+                vec![Span::styled(
+                    format!(" {mark:>1} {:<24}", tech_label(r, t)),
+                    Style::default().fg(c),
+                )],
+                k == sel,
+            )
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(rows).scroll((scroll_for(sel, left.height), 0)),
+        left,
+    );
+    let (mut lines, act) = research_details(app, game, TechId(sel as u16));
+    lines.extend(act);
+    lines.push(research_keys(false));
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: true }),
         right.inner(ratatui::layout::Margin::new(1, 0)),
+    );
+}
+
+/// Splits a tech name over two lines of at most `w` characters, at a space if it can.
+fn two_lines(name: &str, w: usize) -> (String, String) {
+    let fit = |s: &str| -> String {
+        if s.chars().count() <= w {
+            s.to_string()
+        } else {
+            let mut t: String = s.chars().take(w.saturating_sub(1)).collect();
+            t.push('…');
+            t
+        }
+    };
+    if name.chars().count() <= w {
+        return (name.to_string(), String::new());
+    }
+    match name.split_once(' ') {
+        Some((a, b)) => (fit(a), fit(b)),
+        None => (fit(name), String::new()),
+    }
+}
+
+/// Research as a tree: one column per tier, left to right. The selected tech's prerequisites
+/// and the techs it leads to are picked out.
+fn draw_research_tree(
+    f: &mut Frame,
+    app: &App,
+    game: &Game,
+    sel: usize,
+    tiers: &[Vec<TechId>],
+    tree_h: u16,
+) {
+    let full = f.area();
+    let area = centered(
+        full,
+        full.width.saturating_sub(4).min(160),
+        (tree_h + 14).min(full.height),
+    );
+    f.render_widget(Clear, area);
+    let block = modal_block("Research tree");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [canvas, legend, details] = Layout::vertical([
+        Constraint::Length(tree_h),
+        Constraint::Length(1),
+        Constraint::Min(5),
+    ])
+    .areas(inner);
+    let r = &game.world.research;
+    let chosen = TechId(sel as u16);
+    let needs: Vec<TechId> = chosen
+        .get()
+        .prereqs
+        .iter()
+        .filter_map(|p| TechId::by_id(p))
+        .collect();
+    let next = crate::research::leads_to(chosen);
+    let col_w = canvas.width / tiers.len().max(1) as u16;
+    let needs_bg = col((90, 60, 20));
+    let next_bg = col((20, 60, 90));
+    for (c, column) in tiers.iter().enumerate() {
+        let x = canvas.x + c as u16 * col_w;
+        for (k, &t) in column.iter().enumerate() {
+            let y = canvas.y + 1 + k as u16 * 3;
+            let (mark, fg) = tech_mark(r, t, app.ascii);
+            let (a, b) = two_lines(&tech_label(r, t), col_w.saturating_sub(3) as usize);
+            let mut style = Style::default().fg(fg);
+            if t == chosen {
+                style = style.bg(col((70, 70, 110))).add_modifier(Modifier::BOLD);
+            } else if needs.contains(&t) {
+                style = style.bg(needs_bg);
+            } else if next.contains(&t) {
+                style = style.bg(next_bg);
+            }
+            let w = col_w.saturating_sub(1) as usize;
+            let lines = vec![
+                Line::from(Span::styled(
+                    format!("{mark} {a:<w$}", w = w.saturating_sub(2)),
+                    style,
+                )),
+                Line::from(Span::styled(
+                    format!("  {b:<w$}", w = w.saturating_sub(2)),
+                    style,
+                )),
+            ];
+            f.render_widget(
+                Paragraph::new(lines),
+                Rect::new(x, y, col_w.saturating_sub(1), 2),
+            );
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(dim(format!("tier {}", c + 1)))),
+            Rect::new(x, canvas.y, col_w.saturating_sub(1), 1),
+        );
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" needs ", Style::default().bg(needs_bg)),
+            Span::raw(" "),
+            Span::styled(" leads to ", Style::default().bg(next_bg)),
+            dim("   arrows move between techs and tiers"),
+        ])),
+        legend,
+    );
+    let [dl, dr] =
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(details);
+    let (info, mut act) = research_details(app, game, chosen);
+    act.push(research_keys(true));
+    f.render_widget(
+        Paragraph::new(info).wrap(Wrap { trim: true }),
+        dl.inner(ratatui::layout::Margin::new(1, 0)),
+    );
+    f.render_widget(
+        Paragraph::new(act).wrap(Wrap { trim: true }),
+        dr.inner(ratatui::layout::Margin::new(1, 0)),
     );
 }
 
@@ -2266,7 +2599,7 @@ fn draw_entity_panel(
 }
 
 fn draw_menu(f: &mut Frame, sel: usize) {
-    let area = centered(f.area(), 34, MENU_ITEMS.len() as u16 + 4);
+    let area = centered(f.area(), 38, MENU_ITEMS.len() as u16 + 4);
     f.render_widget(Clear, area);
     let block = modal_block("Paused");
     let inner = block.inner(area);
@@ -2274,7 +2607,19 @@ fn draw_menu(f: &mut Frame, sel: usize) {
     let rows: Vec<Line> = MENU_ITEMS
         .iter()
         .enumerate()
-        .map(|(k, m)| list_line(vec![Span::raw(format!("  {m}"))], k == sel))
+        .map(|(k, m)| {
+            let label = if *m == "Colours" {
+                let which = if colorblind() {
+                    "colour-blind safe"
+                } else {
+                    "normal"
+                };
+                format!("  Colours: {which}")
+            } else {
+                format!("  {m}")
+            };
+            list_line(vec![Span::raw(label)], k == sel)
+        })
         .collect();
     f.render_widget(
         Paragraph::new(rows),
@@ -2282,20 +2627,65 @@ fn draw_menu(f: &mut Frame, sel: usize) {
     );
 }
 
-fn draw_stats(f: &mut Frame, game: &Game) {
-    let area = centered(f.area(), 70, 26);
+/// A row of bars, one per value, scaled to the largest. `None` (no data yet) stays blank.
+fn sparkline(vals: &[Option<u64>], ascii: bool) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    const ASCII: [char; 8] = ['_', '.', '-', '~', '=', '+', '*', '#'];
+    let max = vals.iter().flatten().copied().max().unwrap_or(0);
+    vals.iter()
+        .map(|v| match v {
+            None => ' ',
+            Some(0) => {
+                if ascii {
+                    ' '
+                } else {
+                    '·'
+                }
+            }
+            Some(n) => {
+                let k = ((*n as f32 / max.max(1) as f32) * 7.0).round() as usize;
+                if ascii {
+                    ASCII[k.min(7)]
+                } else {
+                    BARS[k.min(7)]
+                }
+            }
+        })
+        .collect()
+}
+
+/// Sparkline spans: 20 of 30 s each, the last 10 minutes.
+const SPARK_SPANS: usize = 20;
+const SPARK_PER: usize = 6;
+
+fn draw_stats(f: &mut Frame, app: &App, game: &Game) {
+    let area = centered(f.area(), 100, 28);
     f.render_widget(Clear, area);
     let block = modal_block("Factory statistics");
     let inner = block.inner(area);
     f.render_widget(block, area);
     let [left, right] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
-    let mut l = vec![header("Produced (total, last minute)")];
+        Layout::horizontal([Constraint::Min(60), Constraint::Length(34)]).areas(inner);
+    let mut l = vec![
+        header("Produced"),
+        Line::from(dim(format!(
+            "{:>8} {:<16} {:>7}  {}",
+            "total", "item", "per min", "last 10 minutes"
+        ))),
+    ];
     for (it, n) in &game.world.produced {
+        let series = game.world.production_series(*it, SPARK_SPANS, SPARK_PER);
         l.push(Line::from(vec![
-            Span::raw(format!("{n:>7} ")),
-            item_span(*it),
-            dim(format!(" {:.0}/m", game.world.rate_per_min(*it, 60))),
+            Span::raw(format!("{n:>8} ")),
+            Span::styled(
+                format!("{:<16}", it.name()),
+                Style::default().fg(col(item_rgb(*it))),
+            ),
+            dim(format!(" {:>7.0}  ", game.world.rate_per_min(*it, 60))),
+            Span::styled(
+                sparkline(&series, app.ascii),
+                Style::default().fg(col(blend(item_rgb(*it), (255, 255, 255), 0.2))),
+            ),
         ]));
     }
     if game.world.produced.is_empty() {
@@ -2683,7 +3073,7 @@ BUILDING
 
 INTERACTING
   e                    inspect the building under the cursor:
-                         t take items, i insert items, f add lignite,
+                         t take items, i insert items, f add 10 fuel,
                          r choose recipe (fabricator) or rotate, x pick up,
                          f choose the item (filter arm),
                          v swap entrance and exit (tunnel belt),
@@ -2694,20 +3084,24 @@ INTERACTING
                          Enter craft 1, f craft 5, F craft max, x cancel
   t                    research tree: Enter researches a tech, or queues
                        it (with anything it needs) after the current one;
-                       n switches right away, x clears the queue
-  g                    production statistics
+                       n switches right away, x clears the queue, Tab
+                       switches between the tree and a plain list
+  g                    production statistics, with the last 10 minutes
+                       of output per item
   l                    message log
 
 GAME
   p pause   f fast-forward (4x)   F5 quick save   F9 quick load
-  Esc menu: save to or load any of 5 slots, quit. F5/F9 use the slot
+  Esc menu: save to or load any of 5 slots, switch to colour-blind
+  safe colours, quit. F5/F9 use the slot
   you last saved to or loaded. The game autosaves every 5 minutes, and
   when you press Ctrl+C or close the terminal, to a separate autosave
   file; Continue picks whichever save is newest.
 
 SETTINGS
   settings.json next to your save (~/.factuio/) turns the mouse off,
-  changes the autosave interval, and remaps keys, for example
+  picks the palette ("palette": "colorblind" swaps red and green for
+  orange and blue), changes the autosave interval, and remaps keys, for example
   "keys": {"mine": "k", "undo": "U"}. Remappable actions: rotate,
   paint, pick, remove, inspect, mine, build_menu, craft, research,
   stats, log, power_overlay, pause, fast, select_area, undo,
@@ -2732,7 +3126,11 @@ MAP LEGEND
   ■g         rail cart and its cargo (ASCII O)
   V◜         survey mast (spins while it surveys)
   ░          unexplored
-  A bold white letter means working; red means something is wrong.
+  A bold white letter means working; red means something is wrong, and a
+  blinking ! marks the building. Working kilns glow and smoke, generators
+  flicker, and arms swing their load across.
+  ⚡ in the top bar: power demand / supply over all grids (yellow or red
+  when short), and how full the battery banks are.
 
 ITEMS ON BELTS
   f ferrite  m malachite  l lignite  q quartz  i iron  c copper  g glass
@@ -3012,6 +3410,88 @@ mod tests {
         let s = render(&a, 120, 40);
         assert!(s.contains('>'));
         assert!(!s.contains('→'));
+    }
+
+    #[test]
+    fn research_shows_a_tree_when_there_is_room() {
+        let mut a = app();
+        a.modal = Modal::Research { sel: 0 };
+        let wide = render(&a, 140, 42);
+        assert!(wide.contains("Research tree"));
+        assert!(wide.contains("tier 9"));
+        assert!(a.tree_shown.get());
+        let small = render(&a, 90, 24);
+        assert!(!small.contains("tier 1"));
+        assert!(small.contains("Fabrication"));
+        assert!(!a.tree_shown.get());
+        a.research_list = true;
+        assert!(!render(&a, 140, 42).contains("tier 9"));
+    }
+
+    #[test]
+    fn stats_draw_sparklines_and_power_reads_well() {
+        assert_eq!(sparkline(&[None, Some(0), Some(2), Some(4)], false), " ·▅█");
+        assert_eq!(sparkline(&[Some(1), Some(1)], true), "##");
+        assert_eq!(fmt_power(450.0), "450 kW");
+        assert_eq!(fmt_power(1800.0), "1.8 MW");
+        assert_eq!(fmt_power(24_000.0), "24 MW");
+        let mut a = app();
+        a.modal = Modal::Stats;
+        assert!(render(&a, 120, 34).contains("last 10 minutes"));
+    }
+
+    fn map_buffer(a: &App) -> Buffer {
+        let mut t = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let g = a.game.as_ref().unwrap();
+        t.draw(|f| f.render_widget(MapView { app: a, game: g }, f.area()))
+            .unwrap();
+        t.backend().buffer().clone()
+    }
+
+    #[test]
+    fn working_kilns_smoke_and_problems_blink() {
+        let mut a = app();
+        let g = a.game.as_mut().unwrap();
+        g.world = crate::world::World::empty(20, 12, 1);
+        g.world.place(5, 5, EntityKind::Kiln, Dir::East).unwrap();
+        let i = g.world.idx(5, 5).unwrap();
+        g.world.insert(i, Item::Lignite, 10, true);
+        g.world.insert(i, Item::FerriteOre, 50, true);
+        g.world.place(9, 5, EntityKind::Lab, Dir::North).unwrap();
+        g.player.cursor = (15, 10);
+        // The map is 20 tiles wide, so tile (x, y) is drawn at columns 2x and 2x + 1.
+        let mut smoke = false;
+        for _ in 0..200 {
+            let g = a.game.as_mut().unwrap();
+            g.world.tick();
+            if g.world.entity(5, 5).unwrap().status != Status::Working {
+                continue;
+            }
+            let buf = map_buffer(&a);
+            smoke |= (10..12).any(|x| ["∘", "°", "."].contains(&buf[(x, 4)].symbol()));
+            if smoke {
+                break;
+            }
+        }
+        assert!(smoke, "no smoke above the kiln");
+        // The lab has nothing to research: its marker shows on blink frames only.
+        a.frame = 0;
+        assert_eq!(map_buffer(&a)[(19, 5)].symbol(), "!");
+        a.frame = 8;
+        assert_ne!(map_buffer(&a)[(19, 5)].symbol(), "!");
+    }
+
+    #[test]
+    fn tech_names_split_over_two_lines() {
+        assert_eq!(two_lines("Optics", 10), ("Optics".into(), String::new()));
+        assert_eq!(
+            two_lines("Logic theory", 8),
+            ("Logic".into(), "theory".into())
+        );
+        assert_eq!(
+            two_lines("Productivity modules", 8),
+            ("Product…".into(), "modules".into())
+        );
     }
 
     #[test]

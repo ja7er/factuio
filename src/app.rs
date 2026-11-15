@@ -95,11 +95,12 @@ impl ConfirmAction {
     }
 }
 
-pub const MENU_ITEMS: [&str; 6] = [
+pub const MENU_ITEMS: [&str; 7] = [
     "Resume",
     "Save to slot…",
     "Load slot…",
     "Help",
+    "Colours",
     "Save & quit to title",
     "Quit without saving",
 ];
@@ -175,6 +176,12 @@ pub struct App {
     pub hotbar_hits: RefCell<Vec<(Rect, usize)>>,
     pub minimap_geom: Cell<MinimapGeom>,
     drag: Option<Drag>,
+    /// Counts redraw ticks, paused or not, for blinking markers.
+    pub frame: u64,
+    /// Show research as a plain list instead of the tree (Tab switches).
+    pub research_list: bool,
+    /// Whether the last frame drew the research tree (it needs room), for arrow keys.
+    pub tree_shown: Cell<bool>,
 }
 
 impl App {
@@ -211,6 +218,9 @@ impl App {
             hotbar_hits: RefCell::new(vec![]),
             minimap_geom: Cell::new(MinimapGeom::default()),
             drag: None,
+            frame: 0,
+            research_list: false,
+            tree_shown: Cell::new(false),
         }
     }
 
@@ -242,6 +252,7 @@ impl App {
         let (map, problems) = s.key_map();
         self.keymap = map;
         self.ascii |= s.ascii;
+        crate::ui::set_colorblind(s.colorblind());
         if !problems.is_empty() {
             self.title_msg = Some(format!("settings.json: {}", problems.join("; ")));
         }
@@ -1522,7 +1533,35 @@ impl App {
 
     fn research_key(&mut self, k: KeyEvent, sel: usize) {
         let n = TechId::all().count();
+        if self.tree_shown.get() {
+            let tiers = crate::research::tech_tiers();
+            let (c, r) = crate::research::tree_pos(&tiers, TechId(sel as u16));
+            let to = match k.code {
+                KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
+                    Some((c, (r + tiers[c].len() - 1) % tiers[c].len()))
+                }
+                KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('j') => {
+                    Some((c, (r + 1) % tiers[c].len()))
+                }
+                KeyCode::Left | KeyCode::Char('a') | KeyCode::Char('h') => {
+                    let c = (c + tiers.len() - 1) % tiers.len();
+                    Some((c, r.min(tiers[c].len() - 1)))
+                }
+                KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('l') => {
+                    let c = (c + 1) % tiers.len();
+                    Some((c, r.min(tiers[c].len() - 1)))
+                }
+                _ => None,
+            };
+            if let Some((c, r)) = to {
+                self.modal = Modal::Research {
+                    sel: tiers[c][r].0 as usize,
+                };
+                return;
+            }
+        }
         match k.code {
+            KeyCode::Tab => self.research_list = !self.research_list,
             KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
                 self.modal = Modal::Research {
                     sel: (sel + n - 1) % n,
@@ -1750,6 +1789,23 @@ impl App {
         }
     }
 
+    /// Switches between the normal and the colour-blind safe palette and remembers the choice.
+    pub fn toggle_palette(&mut self) {
+        let on = !self.settings.colorblind();
+        self.settings.palette = if on { "colorblind" } else { "default" }.into();
+        crate::ui::set_colorblind(on);
+        let msg = match self.settings.save(&self.settings_path()) {
+            Ok(()) if on => {
+                "Colour-blind safe palette on: blue for good, orange for problems.".into()
+            }
+            Ok(()) => "Normal palette.".to_string(),
+            Err(e) => format!("Palette changed, but settings.json couldn't be saved: {e}"),
+        };
+        if let Some(g) = self.game.as_mut() {
+            g.log(msg);
+        }
+    }
+
     fn menu_key(&mut self, k: KeyEvent, sel: usize) {
         let n = MENU_ITEMS.len();
         match k.code {
@@ -1767,7 +1823,8 @@ impl App {
                 1 => self.open_slots(true),
                 2 => self.open_slots(false),
                 3 => self.modal = Modal::Help { scroll: 0 },
-                4 => {
+                4 => self.toggle_palette(),
+                5 => {
                     self.save_game();
                     self.game = None;
                     self.modal = Modal::None;
@@ -1880,6 +1937,42 @@ mod tests {
     }
 
     #[test]
+    fn research_tree_arrows_move_between_tiers() {
+        let mut a = app();
+        let tiers = crate::research::tech_tiers();
+        let at = |c: usize, r: usize| Modal::Research {
+            sel: tiers[c][r].0 as usize,
+        };
+        a.modal = at(0, 0);
+        a.tree_shown.set(true);
+        a.handle_key(key(KeyCode::Right));
+        assert_eq!(a.modal, at(1, 0));
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(a.modal, at(1, 1));
+        a.handle_key(key(KeyCode::Up));
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.modal, at(1, tiers[1].len() - 1));
+        // Going to a shorter column lands on its last tech.
+        a.handle_key(key(KeyCode::Left));
+        assert_eq!(a.modal, at(0, 0));
+        a.handle_key(key(KeyCode::Tab));
+        assert!(a.research_list);
+    }
+
+    #[test]
+    fn palette_toggle_is_remembered() {
+        let mut a = app();
+        a.toggle_palette();
+        assert!(a.settings.colorblind());
+        let (s, _) = Settings::load_or_create(&a.settings_path());
+        assert!(s.colorblind());
+        a.toggle_palette();
+        assert!(!a.settings.colorblind());
+        let (s, _) = Settings::load_or_create(&a.settings_path());
+        assert!(!s.colorblind());
+    }
+
+    #[test]
     fn paint_mode_lays_a_belt_line() {
         let mut a = app();
         let g = a.game.as_mut().unwrap();
@@ -1938,7 +2031,9 @@ mod tests {
         assert!(matches!(a.modal, Modal::Confirm { .. }));
         a.handle_key(key(KeyCode::Char('n')));
         assert_eq!(a.modal, Modal::None);
-        a.modal = Modal::Menu { sel: 5 };
+        a.modal = Modal::Menu {
+            sel: MENU_ITEMS.len() - 1,
+        };
         a.handle_key(key(KeyCode::Enter));
         assert!(!a.quit);
         a.handle_key(key(KeyCode::Char('y')));

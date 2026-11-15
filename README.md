@@ -67,15 +67,15 @@ advertises it through `COLORTERM`; otherwise they fall back to the 256-colour pa
 | e | Inspect: `t` take, `i` insert, `f` add 10 fuel, `r` recipe or rotate |
 | m | Mine the ore under the cursor by hand |
 | c / i / Tab | Crafting and inventory (`Enter` 1, `f` 5, `F` max, `x` cancel) |
-| t | Research tree (`Enter` research or queue, `n` switch now, `x` clear queue) |
-| g | Production statistics (rates over the last minute) |
+| t | Research tree (`Enter` research or queue, `n` switch now, `x` clear queue, `Tab` tree or list) |
+| g | Production statistics (rates over the last minute, and a 10-minute sparkline per item) |
 | l | Message log |
 | n | Jump to the next building with a problem |
 | M | Map overview |
 | o | Power coverage overlay |
 | p / f | Pause / 4× fast-forward |
 | F5 / F9 | Quick save / quick load the current slot (asks first) |
-| Esc | Menu (save to or load one of 5 slots, quit) |
+| Esc | Menu (save to or load one of 5 slots, colour-blind palette, quit) |
 | ? | Help |
 
 **Mouse:** left click places or inspects, left drag lays buildings along the path (or selects an
@@ -114,7 +114,9 @@ to a separate `save.autosave.json`, so it never overwrites a save you made yours
 }
 ```
 
-`keys` remaps play-screen actions: `rotate`, `paint`, `pick`, `remove`, `inspect`, `mine`,
+`palette` is `"default"` or `"colorblind"`, which swaps the red/green signals (working,
+problems, datapacks) for blue/orange ones; the pause menu switches it too. `keys` remaps
+play-screen actions: `rotate`, `paint`, `pick`, `remove`, `inspect`, `mine`,
 `build_menu`, `craft`, `research`, `stats`, `log`, `power_overlay`, `pause`, `fast`,
 `select_area`, `undo`, `next_alert`, `minimap`. Set `autosave_minutes` to 0 to turn autosave
 off, and `mouse` to false to keep your terminal's own text selection.
@@ -205,10 +207,16 @@ research, each level 10% faster and pricier than the last.
 | `■` | Rail cart | Shuttles between depots with up to 400 items (Railways) |
 
 **Power.** Each pylon network sums its generators and panels. When demand exceeds
-supply every machine on that network slows down proportionally.
+supply every machine on that network slows down proportionally. The top bar shows demand
+against supply over all networks (`⚡ 515 kW/1.8 MW`), turning yellow or red when a network
+falls short, and how full the battery banks are.
+
+**At a glance.** A building with a problem blinks a `!` on the map, and `n` jumps to it. Working
+kilns glow and smoke, generators flicker, and arms swing what they carry across their tile.
 
 **Research.** Twenty-five technologies use Alpha, Beta, Gamma and Delta datapacks, plus two
-endless ones. Pick one with `t`, then keep your labs supplied.
+endless ones. Pick one with `t`, then keep your labs supplied. On a wide terminal the research
+screen draws the tree tier by tier, picking out what the selected tech needs and leads to.
 
 The sidebar always shows a **Goal** line telling you what to do next.
 

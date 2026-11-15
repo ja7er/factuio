@@ -252,6 +252,7 @@ fn run(
                 // Too far behind: drop the backlog rather than spiralling.
                 next_tick = now + tick;
             }
+            app.frame = app.frame.wrapping_add(1);
             redraw = true;
         }
     }
