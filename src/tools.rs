@@ -14,6 +14,8 @@ pub struct BpCell {
     pub dir: Dir,
     pub recipe: Option<RecipeId>,
     pub filter: Option<Item>,
+    /// Depots that unload carts.
+    pub unload: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,23 +44,31 @@ pub fn filter_of(state: &State) -> Option<Item> {
     }
 }
 
+pub fn unload_of(state: &State) -> bool {
+    matches!(state, State::Chest { unload: true, .. })
+}
+
+/// A building's settings that blueprints and undo carry over.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Settings {
+    pub recipe: Option<RecipeId>,
+    pub filter: Option<Item>,
+    pub unload: bool,
+}
+
 /// Builds `kind` and restores its settings. Shared by blueprint paste and undo.
-fn rebuild(
-    game: &mut Game,
-    (x, y): (i32, i32),
-    kind: EntityKind,
-    dir: Dir,
-    recipe: Option<RecipeId>,
-    filter: Option<Item>,
-) -> bool {
+fn rebuild(game: &mut Game, (x, y): (i32, i32), kind: EntityKind, dir: Dir, s: Settings) -> bool {
     if game.place_kind(x, y, kind, dir).is_err() {
         return false;
     }
-    if recipe.is_some() {
-        let _ = game.set_recipe(x, y, recipe);
+    if s.recipe.is_some() {
+        let _ = game.set_recipe(x, y, s.recipe);
     }
-    if filter.is_some() {
-        let _ = game.set_filter(x, y, filter);
+    if s.filter.is_some() {
+        let _ = game.set_filter(x, y, s.filter);
+    }
+    if s.unload {
+        game.world.toggle_depot(x, y);
     }
     true
 }
@@ -78,6 +88,7 @@ impl Blueprint {
                         dir: e.dir,
                         recipe: recipe_of(&e.state),
                         filter: filter_of(&e.state),
+                        unload: unload_of(&e.state),
                     });
                 }
             }
@@ -124,7 +135,12 @@ impl Blueprint {
             if game.world.entity(px, py).is_some_and(|e| e.kind == c.kind) {
                 continue;
             }
-            if rebuild(game, (px, py), c.kind, c.dir, c.recipe, c.filter) {
+            let set = Settings {
+                recipe: c.recipe,
+                filter: c.filter,
+                unload: c.unload,
+            };
+            if rebuild(game, (px, py), c.kind, c.dir, set) {
                 steps.push(UndoStep::Placed {
                     x: px,
                     y: py,
@@ -153,13 +169,23 @@ pub enum UndoStep {
         y: i32,
         kind: EntityKind,
         dir: Dir,
-        recipe: Option<RecipeId>,
-        filter: Option<Item>,
+        settings: Settings,
     },
     /// Landfill turned this water tile into sand.
     Filled {
         x: i32,
         y: i32,
+    },
+    /// A rail cart was put on this tile.
+    CartAdded {
+        x: i32,
+        y: i32,
+    },
+    /// `n` rail carts were picked up from this tile (their cargo stays in the inventory).
+    CartsTaken {
+        x: i32,
+        y: i32,
+        n: usize,
     },
 }
 
@@ -170,8 +196,11 @@ impl UndoStep {
             y,
             kind: e.kind,
             dir: e.dir,
-            recipe: recipe_of(&e.state),
-            filter: filter_of(&e.state),
+            settings: Settings {
+                recipe: recipe_of(&e.state),
+                filter: filter_of(&e.state),
+                unload: unload_of(&e.state),
+            },
         }
     }
 
@@ -190,12 +219,8 @@ impl UndoStep {
                 y,
                 kind,
                 dir,
-                recipe,
-                filter,
-            } => {
-                game.world.entity(x, y).is_none()
-                    && rebuild(game, (x, y), kind, dir, recipe, filter)
-            }
+                settings,
+            } => game.world.entity(x, y).is_none() && rebuild(game, (x, y), kind, dir, settings),
             UndoStep::Filled { x, y } => {
                 if game.world.unfill(x, y) {
                     game.player.inventory.add(Item::Landfill, 1);
@@ -204,6 +229,8 @@ impl UndoStep {
                     false
                 }
             }
+            UndoStep::CartAdded { x, y } => game.take_carts(x, y, 1) == 1,
+            UndoStep::CartsTaken { x, y, n } => (0..n).all(|_| game.add_cart(x, y).is_ok()),
         }
     }
 }

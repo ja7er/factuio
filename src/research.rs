@@ -158,7 +158,7 @@ impl Research {
         n != self.queue.len()
     }
 
-    #[cfg(test)]
+    /// Marks `t` researched (scenario head starts, and tests).
     pub fn complete(&mut self, t: TechId) {
         self.progress.insert(t, t.get().units);
         self.done.insert(t);

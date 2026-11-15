@@ -5,8 +5,9 @@
 <p align="center"><b>A factory-automation game for your terminal</b>, written in Rust with <a href="https://ratatui.rs">ratatui</a>.</p>
 
 Start with a handful of buildings on a procedurally generated map. Mine ore, smelt it,
-move it around on conveyors and arms, craft parts, research new technology, and finally
-build the **Uplink array** and feed it 20 relay modules to win.
+move it around on conveyors, arms and rail carts, explore beyond the fog, craft parts,
+research new technology, and finally build the **Uplink array** and feed it 20 relay modules
+to win. New to it? Pick **Tutorial** under New game.
 
 ![A mid-game factory: conveyor lines feeding fabricators that make cogs and coils](docs/screenshot-factory.png)
 
@@ -28,6 +29,7 @@ Options:
 --new             start a new game immediately
 --continue        load the save file immediately
 --seed <N>        world seed for a new game
+--scenario <ID>   start a scenario: standard, tutorial, far-fields, lean, sprint
 --save <PATH>     save file location (default: ~/.factuio/save.json)
 --ascii           ASCII-only glyphs (for terminals without Unicode arrows)
 --256             force 256-colour mode (macOS Terminal.app, older terminals)
@@ -62,7 +64,7 @@ advertises it through `COLORTERM`; otherwise they fall back to the 256-colour pa
 | x / Delete | Pick up a building and everything inside it |
 | u | Undo the last build or pick-up (a paint stroke, drag or paste is one step) |
 | z | Select an area, then `x` to pick it all up or `y` to copy it as a blueprint |
-| e | Inspect: `t` take, `i` insert, `f` add fuel, `r` recipe or rotate |
+| e | Inspect: `t` take, `i` insert, `f` add 10 fuel, `r` recipe or rotate |
 | m | Mine the ore under the cursor by hand |
 | c / i / Tab | Crafting and inventory (`Enter` 1, `f` 5, `F` max, `x` cancel) |
 | t | Research tree (`Enter` research or queue, `n` switch now, `x` clear queue) |
@@ -90,6 +92,10 @@ crossing belts. Inspect either end (`e`) and press `v` to swap entrance and exit
 **Blueprints:** copy an area with `z` … `y`, then `Enter` places it at the cursor, `r` rotates
 it and `Esc` drops it.
 
+**Rails:** lay rails with paint mode (`v`) or a drag; they join up with the rails and depots next
+to them. Put a rail cart on a depot from the build list (`b`). Inspect a depot and press `v` to
+switch it between loading and unloading carts. `x` on a cart picks it up with its cargo.
+
 The game autosaves every five minutes, and when you press Ctrl+C or close the terminal,
 to a separate `save.autosave.json`, so it never overwrites a save you made yourself.
 **Continue** picks whichever save is newest. Every save also keeps the previous file as `.bak`.
@@ -115,8 +121,30 @@ off, and `mouse` to false to keep your terminal's own text selection.
 
 ## How it plays
 
+**New game.** Choose what to play:
+
+| Scenario | What's different |
+| --- | --- |
+| Free play | A new random world (or `--seed N`) |
+| Tutorial | A guided first hour: a card on the map walks you through mining, smelting, belts, power, arms and research |
+| Far fields | No malachite or quartz near spawn; the nearest is 50–60 tiles out in the fog. Starts with rails, depots, a cart and a survey mast |
+| Lean ores | The starter patches hold a third of the usual ore |
+| Sprint | Make 60 Beta datapacks in fabricators, against the clock |
+
+Challenges use the same map for everyone, and keep their own best times in `records.json`.
+
 **Resources.** Four ores spawn near the start, with richer patches further out:
-ferrite, malachite, lignite (fuel) and quartz.
+ferrite, malachite, lignite (fuel) and quartz. The further from spawn, the richer the patch.
+
+**Exploring.** The map is 320×240 tiles and starts out hidden beyond the area around spawn.
+Every building reveals a few tiles around itself (pylons more), so building outward explores, and
+a powered survey mast (Surveying) reveals up to 50 tiles around itself. You can only build where
+you've explored.
+
+**Rail carts.** For ore that's too far to belt (Railways): rails, depots that store 800 items, and
+carts that carry 400 at 8 tiles a second. A cart visits the depots on its track in turn, so two
+depots make a shuttle. At a loading depot it leaves when full, when nothing has arrived for five
+seconds, or after thirty; at an unloading depot it empties out first.
 
 **Production chain.**
 
@@ -171,11 +199,15 @@ research, each level 10% faster and pricier than the last.
 | `Q→` | Sifter | Electric, endless quartz from the sand under it (Sifting) |
 | `H` | Chem plant | Electric assembler for resin and batteries (Chemistry) |
 | `A` | Battery bank | Stores 20 MJ, up to 600 kW in or out (Energy storage) |
+| `V` | Survey mast | Electric; reveals the map up to 50 tiles around it (Surveying) |
+| `═╗` | Rail | Track for rail carts; joins the rails and depots beside it (Railways) |
+| `R+` `R-` | Depot | Rail stop holding 800 items: carts load at `+`, unload at `-` (Railways) |
+| `■` | Rail cart | Shuttles between depots with up to 400 items (Railways) |
 
 **Power.** Each pylon network sums its generators and panels. When demand exceeds
 supply every machine on that network slows down proportionally.
 
-**Research.** Twenty-three technologies use Alpha, Beta, Gamma and Delta datapacks, plus two
+**Research.** Twenty-five technologies use Alpha, Beta, Gamma and Delta datapacks, plus two
 endless ones. Pick one with `t`, then keep your labs supplied.
 
 The sidebar always shows a **Goal** line telling you what to do next.
@@ -194,8 +226,10 @@ Code layout:
 
 - `src/items.rs`: items, buildings, directions
 - `src/recipes.rs`: recipes and the tech tree
-- `src/world.rs`: map generation and the tick simulation (belts, arms, miners, furnaces, fabricators, labs, power)
+- `src/world.rs`: map generation, fog of war and the tick simulation (belts, arms, miners, furnaces, fabricators, labs, power, rail carts)
 - `src/game.rs`: player inventory, hand crafting, building actions, save/load
+- `src/scenario.rs`: free play, the tutorial steps and the challenges
+- `src/records.rs`: best times
 - `src/app.rs`: screens and keyboard handling
 - `src/ui.rs`: ratatui rendering
 - `src/playtest.rs`: scripted playthroughs used by the tests

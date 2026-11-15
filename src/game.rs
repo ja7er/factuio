@@ -3,6 +3,7 @@
 use crate::inventory::Inventory;
 use crate::items::{Dir, EntityKind, Item};
 use crate::recipes::{Category, RecipeId, TechId};
+use crate::scenario::{Goal, STEPS, Scenario, Tutorial};
 use crate::world::{Entity, State, TICKS_PER_SEC, World, WorldSave};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -14,8 +15,8 @@ pub const SAVE_VERSION: u32 = 2;
 /// Seconds an important message (research done, victory) stays highlighted.
 pub const NOTICE_SECS: u64 = 8;
 pub const HAND_MINE_TIME: f32 = 0.6;
-pub const MAP_W: i32 = 160;
-pub const MAP_H: i32 = 120;
+pub const MAP_W: i32 = 320;
+pub const MAP_H: i32 = 240;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CraftJob {
@@ -80,6 +81,8 @@ struct SaveFile {
     version: u32,
     world: WorldSave,
     player: Player,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tutorial: Option<Tutorial>,
 }
 
 /// Brings an older save up to `SAVE_VERSION`, one step at a time.
@@ -140,19 +143,45 @@ pub struct Game {
     pub player: Player,
     pub messages: Vec<LogLine>,
     pub victory_pending: bool,
+    /// Tutorial progress, in the tutorial scenario.
+    pub tutorial: Option<Tutorial>,
+    /// Ore dug by hand this session (for the tutorial).
+    pub hand_mined: u32,
 }
 
 impl Game {
+    #[cfg(test)]
     pub fn new(seed: u64) -> Self {
-        let world = World::generate(MAP_W, MAP_H, seed);
+        Self::with_scenario(Scenario::standard(), seed)
+    }
+
+    /// A new game of `sc`. Scenarios with a fixed map ignore `seed`.
+    pub fn with_scenario(sc: &'static Scenario, seed: u64) -> Self {
+        let seed = sc.seed.unwrap_or(seed);
+        let world = World::generate_scenario(MAP_W, MAP_H, seed, sc);
         let spawn = world.spawn();
         let mut g = Game {
             world,
             player: Player::new(spawn),
             messages: vec![],
             victory_pending: false,
+            tutorial: sc.tutorial.then_some(Tutorial { step: 0, since: 0 }),
+            hand_mined: 0,
         };
+        for &(item, n) in sc.kit {
+            g.player.inventory.add(item, n);
+        }
+        for t in sc.techs {
+            if let Some(t) = TechId::by_id(t) {
+                g.world.research.complete(t);
+            }
+        }
         g.log("Welcome to factuio! Press ? for help.");
+        if sc.tutorial {
+            g.notify("Tutorial: follow the steps in the card at the top right of the map.");
+        } else if !sc.is_standard() {
+            g.notify(format!("{}: {}.", sc.name, sc.goal_text()));
+        }
         g
     }
 
@@ -164,6 +193,8 @@ impl Game {
             player: Player::new(spawn),
             messages: vec![],
             victory_pending: false,
+            tutorial: None,
+            hand_mined: 0,
         }
     }
 
@@ -208,6 +239,29 @@ impl Game {
         if self.world.won && !was_won {
             self.victory_pending = true;
         }
+        self.tick_tutorial();
+    }
+
+    fn tick_tutorial(&mut self) {
+        let Some(t) = self.tutorial else { return };
+        if t.finished() || !(STEPS[t.step].done)(self, &t) {
+            return;
+        }
+        let next = Tutorial {
+            step: t.step + 1,
+            since: self.world.tick,
+        };
+        self.tutorial = Some(next);
+        match STEPS.get(next.step) {
+            Some(s) => self.notify(format!("Tutorial: {}", s.title)),
+            None => self.log("Tutorial complete."),
+        }
+    }
+
+    /// The tutorial step to show, if one is running.
+    pub fn tutorial_step(&self) -> Option<(usize, &'static crate::scenario::Step)> {
+        let t = self.tutorial?;
+        STEPS.get(t.step).map(|s| (t.step, s))
     }
 
     // ---- Building ----
@@ -325,10 +379,11 @@ impl Game {
         n
     }
 
-    /// Adds fuel from the inventory: lignite first, then coke. Returns what went in.
+    /// Adds up to 10 fuel from the inventory: lignite first, then coke. Returns what went in.
+    /// A small step, so the starting lignite stretches over a digger, a kiln and a generator.
     pub fn add_fuel(&mut self, x: i32, y: i32) -> Option<(Item, u32)> {
         for f in [Item::Lignite, Item::Coke] {
-            let n = self.insert(x, y, f, 50);
+            let n = self.insert(x, y, f, 10);
             if n > 0 {
                 return Some((f, n));
             }
@@ -364,13 +419,37 @@ impl Game {
             .collect()
     }
 
-    /// Picks up the building at (x, y) along with everything inside it.
+    /// Picks up the building at (x, y) along with everything inside it, and any carts on it.
     pub fn remove(&mut self, x: i32, y: i32) -> Result<EntityKind, String> {
         let e = self.world.remove(x, y).ok_or("Nothing to remove here")?;
+        self.take_carts(x, y, usize::MAX);
         let mut c = e.contents();
         c.add(e.kind.item(), 1);
         c.drain_into(&mut self.player.inventory);
         Ok(e.kind)
+    }
+
+    /// Puts a rail cart from the inventory on the rail or depot at (x, y).
+    pub fn add_cart(&mut self, x: i32, y: i32) -> Result<(), String> {
+        if self.player.inventory.count(Item::Cart) == 0 {
+            return Err("No Rail cart in inventory".into());
+        }
+        self.world.add_cart(x, y)?;
+        self.player.inventory.remove(Item::Cart, 1);
+        Ok(())
+    }
+
+    /// Picks up to `max` carts on (x, y), with their cargo. Returns how many.
+    pub fn take_carts(&mut self, x: i32, y: i32, max: usize) -> usize {
+        let Some(i) = self.world.idx(x, y) else {
+            return 0;
+        };
+        let carts = self.world.take_carts(i, max);
+        for mut c in carts.iter().cloned() {
+            c.cargo.drain_into(&mut self.player.inventory);
+            self.player.inventory.add(Item::Cart, 1);
+        }
+        carts.len()
     }
 
     /// Takes the outputs (or stored items) of the building at (x, y).
@@ -397,11 +476,16 @@ impl Game {
             }
             State::Furnace { output, .. }
             | State::Assembler { output, .. }
-            | State::Chest { inv: output } => {
+            | State::Chest { inv: output, .. } => {
                 output.drain_into(&mut got);
             }
             State::Lab { inv, .. } | State::Uplink { inv, .. } => inv.drain_into(&mut got),
-            State::Generator { .. } | State::Pylon | State::Solar | State::Battery { .. } => {}
+            State::Generator { .. }
+            | State::Pylon
+            | State::Solar
+            | State::Battery { .. }
+            | State::Rail
+            | State::Survey { .. } => {}
         }
         let n = got.total();
         got.drain_into(&mut self.player.inventory);
@@ -624,6 +708,9 @@ impl Game {
             return Ok(false);
         }
         let (x, y) = self.player.cursor;
+        if !self.world.is_explored(x, y) {
+            return Err("You can't see what's there yet".into());
+        }
         match self.world.tile(x, y) {
             Some(t) if t.ore.is_some() => {
                 self.player.mining = Some((x, y));
@@ -654,6 +741,7 @@ impl Game {
                     self.player.mining = None;
                 }
                 self.player.inventory.add(ore, 1);
+                self.hand_mined += 1;
             } else {
                 self.player.mining = None;
             }
@@ -667,6 +755,7 @@ impl Game {
             version: SAVE_VERSION,
             world: self.world.to_save(),
             player: self.player.clone(),
+            tutorial: self.tutorial,
         };
         serde_json::to_string(&s).map_err(|e| e.to_string())
     }
@@ -681,6 +770,8 @@ impl Game {
             player: s.player,
             messages: vec![],
             victory_pending: false,
+            tutorial: s.tutorial,
+            hand_mined: 0,
         };
         g.log("Game loaded.");
         Ok(g)
@@ -708,6 +799,28 @@ impl Game {
 
     /// A short hint about what to do next.
     pub fn objective(&self) -> String {
+        let w = &self.world;
+        let has = |k: EntityKind| w.entities.iter().flatten().any(|e| e.kind == k);
+        let r = &w.research;
+        let tech = |id: &str| TechId::by_id(id).is_some_and(|t| r.is_done(t));
+        if let Goal::Produce(item, n) = w.scenario.goal {
+            let have = w.produced.get(&item).copied().unwrap_or(0);
+            if w.won {
+                return format!(
+                    "Challenge complete in {}! Keep building, or try another from the title screen.",
+                    clock(w.won_at.unwrap_or(w.tick))
+                );
+            }
+            let goal = format!("{} ({}/{n}).", w.scenario.goal_text(), have.min(n));
+            if tech("logic") && has(EntityKind::Fabricator) {
+                return goal;
+            }
+            return format!("{goal} First: {}", self.uplink_objective());
+        }
+        self.uplink_objective()
+    }
+
+    fn uplink_objective(&self) -> String {
         let w = &self.world;
         let has = |k: EntityKind| w.entities.iter().flatten().any(|e| e.kind == k);
         let r = &w.research;
@@ -1020,5 +1133,114 @@ mod tests {
         g.place(5, 5, Item::Kiln, Dir::North).unwrap();
         assert_eq!(g.add_fuel(5, 5), Some((Item::Coke, 10)));
         assert_eq!(g.add_fuel(5, 5), None);
+    }
+
+    #[test]
+    fn scenarios_start_with_their_kit_techs_and_map() {
+        let sc = Scenario::by_id("far-fields").unwrap();
+        let a = Game::with_scenario(sc, 1);
+        let b = Game::with_scenario(sc, 2);
+        // A fixed map: the seed asked for doesn't matter.
+        assert_eq!(a.world.seed, 31337);
+        assert_eq!(a.world.tiles, b.world.tiles);
+        assert_eq!(a.player.inventory.count(Item::Rail), 120);
+        assert_eq!(a.player.inventory.count(Item::Cart), 1);
+        assert!(a.world.research.is_done(TechId::by_id("railways").unwrap()));
+        assert!(a.status_message().unwrap().text.contains("Far fields"));
+        // Free play uses the seed it's given, and the save remembers the scenario.
+        let f = Game::with_scenario(Scenario::standard(), 9);
+        assert_eq!(f.world.seed, 9);
+        let back = Game::from_json(&a.to_json().unwrap()).unwrap();
+        assert_eq!(back.world.scenario.id, "far-fields");
+        assert_eq!(back.world.explored, a.world.explored);
+    }
+
+    #[test]
+    fn a_sprint_objective_counts_toward_its_goal() {
+        let mut g = Game::with_scenario(Scenario::by_id("sprint").unwrap(), 0);
+        assert!(g.objective().contains("Make 60 Beta datapacks"));
+        assert!(g.objective().contains("First:"));
+        g.world.produced.insert(Item::BetaPack, 60);
+        g.tick();
+        assert!(g.victory_pending && g.world.won);
+        assert!(g.objective().contains("Challenge complete"));
+    }
+
+    #[test]
+    fn hand_mining_needs_explored_ground() {
+        let mut g = game();
+        let i = g.world.idx(3, 3).unwrap();
+        g.world.tiles[i].ore = Some(Item::Quartz);
+        g.world.tiles[i].amount = 10;
+        g.world.explored[i] = false;
+        g.player.cursor = (3, 3);
+        assert!(g.toggle_mining().is_err());
+        g.world.explored[i] = true;
+        assert!(g.toggle_mining().unwrap());
+        run(&mut g, 2);
+        assert_eq!(g.hand_mined, 3);
+    }
+
+    #[test]
+    fn picking_up_track_takes_its_carts_and_cargo() {
+        let mut g = game();
+        g.player.inventory.add(Item::Depot, 1);
+        g.player.inventory.add(Item::Cart, 2);
+        g.place(4, 4, Item::Depot, Dir::North).unwrap();
+        assert!(g.add_cart(5, 5).is_err());
+        g.add_cart(4, 4).unwrap();
+        g.add_cart(4, 4).unwrap();
+        assert!(g.add_cart(4, 4).is_err(), "out of carts");
+        g.world.carts[0].cargo.add(Item::Chip, 40);
+        g.remove(4, 4).unwrap();
+        assert!(g.world.carts.is_empty());
+        assert_eq!(g.player.inventory.count(Item::Cart), 2);
+        assert_eq!(g.player.inventory.count(Item::Depot), 1);
+        assert_eq!(g.player.inventory.count(Item::Chip), 40);
+    }
+
+    #[test]
+    fn the_tutorial_moves_on_as_each_step_is_done() {
+        let mut g = Game::with_scenario(Scenario::by_id("tutorial").unwrap(), 0);
+        let step = |g: &Game| g.tutorial.unwrap().step;
+        assert_eq!(g.tutorial_step().unwrap().1.title, "Look around");
+        g.tick();
+        assert_eq!(step(&g), 0);
+        // 1: put the cursor on ferrite ore.
+        let (cx, cy) = g.world.spawn();
+        let ore = (cy - 20..cy + 20)
+            .flat_map(|y| (cx - 20..cx + 20).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                g.world.tile(x, y).unwrap().ore == Some(Item::FerriteOre)
+                    && g.world.tile(x + 1, y).unwrap().ore == Some(Item::FerriteOre)
+                    && g.world.entity(x, y).is_none()
+            })
+            .unwrap();
+        g.player.cursor = ore;
+        g.tick();
+        assert_eq!(step(&g), 1);
+        assert!(g.status_message().unwrap().text.contains("Dig by hand"));
+        // 2: dig 5 by hand.
+        g.toggle_mining().unwrap();
+        run(&mut g, 4);
+        assert_eq!(step(&g), 2);
+        // 3 and 4: a digger, fuelled.
+        g.place(ore.0, ore.1, Item::Digger, Dir::East).unwrap();
+        g.tick();
+        assert_eq!(step(&g), 3);
+        assert_eq!(g.add_fuel(ore.0, ore.1), Some((Item::Lignite, 10)));
+        g.tick();
+        assert_eq!(step(&g), 4);
+        // Progress is saved.
+        let back = Game::from_json(&g.to_json().unwrap()).unwrap();
+        assert_eq!(back.tutorial, g.tutorial);
+        // The last step closes itself after a while.
+        g.tutorial = Some(Tutorial {
+            step: STEPS.len() - 1,
+            since: g.world.tick,
+        });
+        run(&mut g, 31);
+        assert!(g.tutorial.unwrap().finished());
+        assert!(g.tutorial_step().is_none());
     }
 }

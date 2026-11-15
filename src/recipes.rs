@@ -110,6 +110,10 @@ pub static RECIPES: &[Recipe] = &[
     r!("sifter", [Steel 4, Cog 6, Motor 1, Chip 2] => [Sifter 1], 2.0, Craft, false),
     r!("chem-plant", [Steel 8, Glass 10, Chip 5, Motor 2] => [ChemPlant 1], 5.0, Craft, false),
     r!("battery-bank", [Battery 10, Steel 4, Chip 2] => [BatteryBank 1], 5.0, Craft, false),
+    r!("survey-mast", [IronIngot 10, Chip 4, Glass 4] => [SurveyMast 1], 3.0, Craft, false),
+    r!("rail", [Steel 1, IronIngot 2] => [Rail 4], 1.0, Craft, false),
+    r!("depot", [Crate 1, Steel 2, Chip 2] => [Depot 1], 2.0, Craft, false),
+    r!("cart", [Steel 4, Cog 6, Motor 1] => [Cart 1], 4.0, Craft, false),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -293,6 +297,28 @@ pub static TECHS: &[Tech] = &[
         unit_time: 4.0,
         prereqs: &["metallurgy", "logic"],
         unlocks: &["arc-furnace"],
+        repeatable: false,
+    },
+    Tech {
+        id: "surveying",
+        name: "Surveying",
+        desc: "Survey masts that reveal the land around them, further the longer they run.",
+        packs: &[AlphaPack],
+        units: 15,
+        unit_time: 3.0,
+        prereqs: &["fabrication"],
+        unlocks: &["survey-mast"],
+        repeatable: false,
+    },
+    Tech {
+        id: "railways",
+        name: "Railways",
+        desc: "Rails, depots and rail carts that haul 400 items at a time between depots.",
+        packs: &[AlphaPack, BetaPack],
+        units: 40,
+        unit_time: 4.0,
+        prereqs: &["motors", "logistics"],
+        unlocks: &["rail", "depot", "cart"],
         repeatable: false,
     },
     Tech {

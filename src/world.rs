@@ -4,8 +4,9 @@ use crate::inventory::Inventory;
 use crate::items::{BANK_RATE, Dir, EntityKind, Item};
 use crate::recipes::{Category, RecipeId};
 use crate::research::Research;
+use crate::scenario::{Goal, Scenario};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub const TICKS_PER_SEC: u32 = 20;
 /// Length of a conveyor tile in sub-tile units.
@@ -32,6 +33,28 @@ pub const TURBINE_EFFICIENCY: f32 = 1.5;
 pub const SIFT_TIME: f32 = 4.0;
 /// Transmissions after the win that mark a milestone: each doubles the last.
 pub const MILESTONE_BASE: u32 = 40;
+/// How far around spawn the map starts out explored.
+pub const START_REVEAL: i32 = 32;
+/// Furthest a survey mast sees, and how fast its view grows (tiles per second at full power).
+pub const SURVEY_MAX: f32 = 50.0;
+pub const SURVEY_SPEED: f32 = 0.5;
+/// Rail carts: tiles per second, items carried, items moved per tick at a depot.
+pub const CART_SPEED: f32 = 8.0;
+pub const CART_CAP: u32 = 400;
+pub const CART_TRANSFER: u32 = 2;
+/// A loading cart leaves after this many seconds without anything to load, if it has cargo...
+pub const CART_IDLE_SECS: u32 = 5;
+/// ...and after this long at the depot in any case, if it has cargo.
+pub const CART_MAX_STOP_SECS: u32 = 30;
+
+/// How far around itself a newly built building lets you see.
+pub fn reveal_radius(kind: EntityKind) -> i32 {
+    match kind {
+        EntityKind::Pylon => 9,
+        EntityKind::SurveyMast => 8,
+        _ => 5,
+    }
+}
 
 /// Share of full sunlight at `tick`: a long day, an hour-long dusk and dawn, and a night.
 pub fn daylight_at(tick: u64) -> f32 {
@@ -206,6 +229,10 @@ fn is_zero_f32(n: &f32) -> bool {
     *n == 0.0
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum State {
     /// Conveyors, splitters and tunnel belts. Items are sorted by `pos`, furthest along last.
@@ -243,8 +270,12 @@ pub enum State {
         working: bool,
         progress: f32,
     },
+    /// Crates and depots.
     Chest {
         inv: Inventory,
+        /// Depots only: carts unload here instead of loading.
+        #[serde(default, skip_serializing_if = "is_false")]
+        unload: bool,
     },
     /// Generators and steam turbines. Only turbines use water.
     Generator {
@@ -261,6 +292,11 @@ pub enum State {
     },
     Pylon,
     Solar,
+    Rail,
+    Survey {
+        /// How far around the mast is revealed, in tiles.
+        radius: f32,
+    },
     Lab {
         inv: Inventory,
         working: bool,
@@ -332,8 +368,13 @@ impl Entity {
                 working: false,
                 progress: 0.0,
             },
-            EntityKind::Crate => State::Chest {
+            EntityKind::Crate | EntityKind::Depot => State::Chest {
                 inv: Inventory::new(),
+                unload: false,
+            },
+            EntityKind::Rail => State::Rail,
+            EntityKind::SurveyMast => State::Survey {
+                radius: reveal_radius(kind) as f32,
             },
             EntityKind::Generator | EntityKind::SteamTurbine => State::Generator {
                 fuel: Fuel::default(),
@@ -415,14 +456,18 @@ impl Entity {
                     inv.add_all(r.get().inputs, 1);
                 }
             }
-            State::Chest { inv: c } => merge(&mut inv, c),
+            State::Chest { inv: c, .. } => merge(&mut inv, c),
             State::Generator { fuel, water, .. } => {
                 add_fuel(&mut inv, fuel);
                 if *water > 0 {
                     inv.add(Item::Water, *water);
                 }
             }
-            State::Pylon | State::Solar | State::Battery { .. } => {}
+            State::Pylon
+            | State::Solar
+            | State::Battery { .. }
+            | State::Rail
+            | State::Survey { .. } => {}
             State::Lab {
                 inv: l,
                 working,
@@ -473,6 +518,112 @@ pub struct Net {
     pub storage: f32,
     /// Battery flow last tick in kW: positive while charging, negative while discharging.
     pub battery_flow: f32,
+}
+
+/// A rail cart: it shuttles between the depots on its track.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cart {
+    /// The tile it's on.
+    pub at: u32,
+    /// Tiles still ahead, the next one last (the destination first). Empty while stopped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<u32>,
+    /// How far it has rolled toward the next tile, 0 to 1.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub moved: f32,
+    #[serde(default)]
+    pub cargo: Inventory,
+    /// Ticks stopped at this depot, and ticks since it last loaded or unloaded anything.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub stopped: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub idle: u32,
+    #[serde(skip)]
+    pub status: CartStatus,
+}
+
+impl Cart {
+    pub fn new(at: usize) -> Cart {
+        Cart {
+            at: at as u32,
+            path: vec![],
+            moved: 0.0,
+            cargo: Inventory::new(),
+            stopped: 0,
+            idle: 0,
+            status: CartStatus::Waiting,
+        }
+    }
+
+    /// The tile to draw it on: the next one once it's more than halfway there.
+    pub fn shown_at(&self) -> usize {
+        match self.path.last() {
+            Some(&n) if self.moved >= 0.5 => n as usize,
+            _ => self.at as usize,
+        }
+    }
+
+    /// The depot it's heading for.
+    pub fn destination(&self) -> Option<usize> {
+        self.path.first().map(|&d| d as usize)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CartStatus {
+    #[default]
+    Waiting,
+    Loading,
+    Unloading,
+    Moving,
+    DepotFull,
+    NoRoute,
+}
+
+impl CartStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            CartStatus::Waiting => "waiting for cargo",
+            CartStatus::Loading => "loading",
+            CartStatus::Unloading => "unloading",
+            CartStatus::Moving => "on its way",
+            CartStatus::DepotFull => "depot full",
+            CartStatus::NoRoute => "no other depot on its track",
+        }
+    }
+}
+
+/// Run lengths of a bit list, starting with a run of `false` (which may be empty).
+fn encode_runs(bits: &[bool]) -> Vec<u32> {
+    let mut runs = vec![];
+    let (mut cur, mut n) = (false, 0u32);
+    for &b in bits {
+        if b == cur {
+            n += 1;
+        } else {
+            runs.push(n);
+            cur = b;
+            n = 1;
+        }
+    }
+    runs.push(n);
+    runs
+}
+
+fn decode_runs(runs: &[u32], len: usize) -> Result<Vec<bool>, String> {
+    let mut v = Vec::with_capacity(len);
+    let mut cur = false;
+    for &r in runs {
+        if v.len() + r as usize > len {
+            return Err("explored map size mismatch".into());
+        }
+        v.extend(std::iter::repeat_n(cur, r as usize));
+        cur = !cur;
+    }
+    if v.len() != len {
+        return Err("explored map size mismatch".into());
+    }
+    Ok(v)
 }
 
 /// Small deterministic PRNG (SplitMix64).
@@ -573,6 +724,11 @@ pub struct World {
     pub nets: Vec<Net>,
     /// For each tunnel piece, the index of its other end (`NO_PAIR` if none).
     pair: Vec<u32>,
+    /// Tiles the player has seen. Building needs explored ground.
+    pub explored: Vec<bool>,
+    pub carts: Vec<Cart>,
+    /// The rules this world was made with.
+    pub scenario: &'static Scenario,
 }
 
 pub const ORES: [Item; 4] = [
@@ -615,11 +771,21 @@ impl World {
             power_net: vec![NO_NET; n],
             nets: vec![],
             pair: vec![NO_PAIR; n],
+            explored: vec![true; n],
+            carts: vec![],
+            scenario: Scenario::standard(),
         }
     }
 
+    #[cfg(test)]
     pub fn generate(width: i32, height: i32, seed: u64) -> Self {
+        Self::generate_scenario(width, height, seed, Scenario::standard())
+    }
+
+    /// A new world with ore, lakes and fog, following the scenario's rules.
+    pub fn generate_scenario(width: i32, height: i32, seed: u64, sc: &'static Scenario) -> Self {
         let mut w = World::empty(width, height, seed);
+        w.scenario = sc;
         let (cx, cy) = w.spawn();
         // Terrain: lakes and beaches, kept away from spawn.
         for y in 0..height {
@@ -639,25 +805,32 @@ impl World {
             }
         }
         let mut rng = Rng::new(seed);
-        // Guaranteed starter patches around spawn.
+        // Guaranteed starter patches around spawn. A scenario can push some far out instead.
         let start_angle = rng.f32() * std::f32::consts::TAU;
         for (k, ore) in ORES.iter().enumerate() {
+            let far = sc.far_ores.contains(ore);
             let a = start_angle + k as f32 * std::f32::consts::FRAC_PI_2;
-            let dist = 9.0 + rng.f32() * 4.0;
+            let dist = if far { 50.0 } else { 9.0 } + rng.f32() * if far { 10.0 } else { 4.0 };
             let px = cx + (a.cos() * dist) as i32;
             let py = cy + (a.sin() * dist) as i32;
             let r = 4.0 + rng.f32() * 1.5;
-            w.place_patch(&mut rng, *ore, px, py, r, 700);
+            let rich = if far {
+                2000
+            } else {
+                (700.0 * sc.starter_ore) as u32
+            };
+            w.place_patch(&mut rng, *ore, px, py, r, rich);
         }
         // Scattered richer patches further out.
         let count = (width * height / 900).max(8);
         for k in 0..count {
             let ore = ORES[(k as usize) % ORES.len()];
+            let near = if sc.far_ores.contains(&ore) { 50 } else { 30 };
             for _ in 0..20 {
                 let px = rng.range(4, width - 5);
                 let py = rng.range(4, height - 5);
                 let d2 = (px - cx).pow(2) + (py - cy).pow(2);
-                if d2 > 30 * 30 {
+                if d2 > near * near {
                     let rich = 900 + (d2 as f32).sqrt() as u32 * 15;
                     let r = 4.5 + rng.f32() * 4.0;
                     w.place_patch(&mut rng, ore, px, py, r, rich);
@@ -665,7 +838,30 @@ impl World {
                 }
             }
         }
+        // Everything beyond the area around spawn starts out unexplored.
+        w.explored.iter_mut().for_each(|e| *e = false);
+        w.reveal(cx, cy, START_REVEAL);
         w
+    }
+
+    /// Marks every tile within `r` of (x, y) as explored.
+    pub fn reveal(&mut self, x: i32, y: i32, r: i32) {
+        for yy in (y - r).max(0)..=(y + r).min(self.height - 1) {
+            for xx in (x - r).max(0)..=(x + r).min(self.width - 1) {
+                if (xx - x).pow(2) + (yy - y).pow(2) <= r * r {
+                    self.explored[(yy * self.width + xx) as usize] = true;
+                }
+            }
+        }
+    }
+
+    pub fn is_explored(&self, x: i32, y: i32) -> bool {
+        self.idx(x, y).is_some_and(|i| self.explored[i])
+    }
+
+    /// Share of the map explored, 0 to 1.
+    pub fn explored_share(&self) -> f32 {
+        self.explored.iter().filter(|&&e| e).count() as f32 / self.explored.len().max(1) as f32
     }
 
     fn place_patch(&mut self, rng: &mut Rng, ore: Item, px: i32, py: i32, r: f32, rich: u32) {
@@ -768,6 +964,11 @@ impl World {
         let Some(i) = self.idx(x, y) else {
             return Err("Out of bounds".into());
         };
+        if !self.explored[i] {
+            return Err(
+                "Unexplored ground: build closer to what you've seen, or use a survey mast".into(),
+            );
+        }
         if self.entities[i].is_some() {
             return Err("Tile is occupied".into());
         }
@@ -789,6 +990,9 @@ impl World {
     /// Turns the water tile at (x, y) into sand.
     pub fn fill(&mut self, x: i32, y: i32) -> Result<(), String> {
         let i = self.idx(x, y).ok_or("Out of bounds")?;
+        if !self.explored[i] {
+            return Err("Unexplored ground: you can't see where to fill".into());
+        }
         if self.tiles[i].terrain != Terrain::Water {
             return Err("Landfill only goes on water".into());
         }
@@ -816,6 +1020,7 @@ impl World {
         let i = self.idx(x, y).unwrap();
         self.entities[i] = Some(Entity::new(kind, dir));
         self.dirty = true;
+        self.reveal(x, y, reveal_radius(kind));
         Ok(())
     }
 
@@ -1003,6 +1208,8 @@ impl World {
             let Some(e) = e else { continue };
             if e.kind.is_transport() {
                 belts.push(i);
+            } else if e.kind == EntityKind::Rail {
+                // Carts do the work on rails.
             } else if e.kind == EntityKind::Pylon {
                 pylons.push(i);
             } else if e.kind.power_output() > 0.0 {
@@ -1149,9 +1356,21 @@ impl World {
             self.update_machine(i);
         }
         self.machines = machines;
+        self.update_carts();
         for n in &mut self.nets {
             n.demand_prev = n.demand_cur;
             n.demand_cur = 0.0;
+        }
+        if let Goal::Produce(item, n) = self.scenario.goal
+            && !self.won
+            && self.produced.get(&item).copied().unwrap_or(0) >= n
+        {
+            self.won = true;
+            self.won_at = Some(self.tick);
+            self.events.push(format!(
+                "Challenge complete: {}. You win!",
+                self.scenario.goal_text().to_lowercase()
+            ));
         }
         self.tick += 1;
         if self.tick.is_multiple_of(HISTORY_INTERVAL) {
@@ -1433,7 +1652,12 @@ impl World {
                     0
                 }
             }
-            State::Arm { .. } | State::Pylon | State::Solar | State::Battery { .. } => 0,
+            State::Arm { .. }
+            | State::Pylon
+            | State::Solar
+            | State::Battery { .. }
+            | State::Rail
+            | State::Survey { .. } => 0,
             State::Miner { fuel, .. } => {
                 if e.kind == EntityKind::Digger {
                     fuel_room(fuel)
@@ -1463,7 +1687,7 @@ impl World {
                 let cap = if manual { need * 20 } else { need * 2 };
                 cap.saturating_sub(input.count(item))
             }
-            State::Chest { inv } => CRATE_CAP.saturating_sub(inv.total()),
+            State::Chest { inv, .. } => CRATE_CAP.saturating_sub(inv.total()),
             State::Generator { fuel, water, .. } => {
                 if item == Item::Water && e.kind == EntityKind::SteamTurbine {
                     let cap = if manual { 200 } else { 20 };
@@ -1543,11 +1767,16 @@ impl World {
                 input.add(item, cap);
                 cap
             }
-            State::Chest { inv } | State::Lab { inv, .. } | State::Uplink { inv, .. } => {
+            State::Chest { inv, .. } | State::Lab { inv, .. } | State::Uplink { inv, .. } => {
                 inv.add(item, cap);
                 cap
             }
-            State::Arm { .. } | State::Pylon | State::Solar | State::Battery { .. } => 0,
+            State::Arm { .. }
+            | State::Pylon
+            | State::Solar
+            | State::Battery { .. }
+            | State::Rail
+            | State::Survey { .. } => 0,
         }
     }
 
@@ -1568,7 +1797,7 @@ impl World {
                 v
             }
             State::Furnace { output, .. } | State::Assembler { output, .. } => output.items(),
-            State::Chest { inv } => inv.items(),
+            State::Chest { inv, .. } => inv.items(),
             _ => vec![],
         }
     }
@@ -1592,7 +1821,7 @@ impl World {
             }
             State::Furnace { output, .. }
             | State::Assembler { output, .. }
-            | State::Chest { inv: output } => output.remove(item, 1),
+            | State::Chest { inv: output, .. } => output.remove(item, 1),
             _ => false,
         }
     }
@@ -1611,7 +1840,8 @@ impl World {
             EntityKind::Fabricator | EntityKind::ChemPlant => self.update_assembler(i, &mut e),
             EntityKind::Lab => self.update_lab(i, &mut e),
             EntityKind::Uplink => self.update_uplink(i, &mut e),
-            EntityKind::Crate => {
+            EntityKind::SurveyMast => self.update_survey(i, &mut e),
+            EntityKind::Crate | EntityKind::Depot => {
                 e.status = Status::Idle;
             }
             _ => {}
@@ -2033,7 +2263,7 @@ impl World {
             *progress = 0.0;
             let before = self.next_milestone();
             self.transmitted += 1;
-            if self.transmitted >= UPLINK_GOAL && !self.won {
+            if self.transmitted >= UPLINK_GOAL && !self.won && self.scenario.goal == Goal::Uplink {
                 self.won = true;
                 self.won_at = Some(self.tick);
                 self.events
@@ -2048,6 +2278,276 @@ impl World {
             }
         }
         e.status = status;
+    }
+
+    fn update_survey(&mut self, i: usize, e: &mut Entity) {
+        let kind = e.kind;
+        let State::Survey { radius } = &mut e.state else {
+            return;
+        };
+        if *radius >= SURVEY_MAX {
+            e.status = Status::Idle;
+            return;
+        }
+        let mut status = Status::Working;
+        let rate = self.electric(i, kind, &mut status);
+        let before = radius.floor();
+        *radius = (*radius + SURVEY_SPEED * rate / TICKS_PER_SEC as f32).min(SURVEY_MAX);
+        if radius.floor() > before {
+            let (x, y) = self.pos(i);
+            self.reveal(x, y, *radius as i32);
+        }
+        e.status = status;
+    }
+
+    // ---- Rail carts ----
+
+    fn is_track(&self, i: usize) -> bool {
+        self.entities[i].as_ref().is_some_and(|e| e.kind.is_track())
+    }
+
+    /// Whether the depot at `i` unloads carts, or `None` if there is no depot there.
+    pub fn depot_unloads(&self, i: usize) -> Option<bool> {
+        match self.entities[i].as_ref() {
+            Some(Entity {
+                kind: EntityKind::Depot,
+                state: State::Chest { unload, .. },
+                ..
+            }) => Some(*unload),
+            _ => None,
+        }
+    }
+
+    /// Switches a depot between loading and unloading carts. Returns the new setting.
+    pub fn toggle_depot(&mut self, x: i32, y: i32) -> Option<bool> {
+        match self.entity_mut(x, y) {
+            Some(Entity {
+                kind: EntityKind::Depot,
+                state: State::Chest { unload, .. },
+                ..
+            }) => {
+                *unload = !*unload;
+                Some(*unload)
+            }
+            _ => None,
+        }
+    }
+
+    /// Puts a new, empty cart on the rail or depot at (x, y).
+    pub fn add_cart(&mut self, x: i32, y: i32) -> Result<(), String> {
+        let i = self.idx(x, y).ok_or("Out of bounds")?;
+        if !self.is_track(i) {
+            return Err("Rail carts go on a rail or a depot".into());
+        }
+        self.carts.push(Cart::new(i));
+        Ok(())
+    }
+
+    /// The carts shown on tile `i`.
+    pub fn carts_at(&self, i: usize) -> impl Iterator<Item = &Cart> {
+        self.carts.iter().filter(move |c| c.shown_at() == i)
+    }
+
+    /// Takes the carts on (or just leaving) tile `i` off the map, newest first.
+    pub fn take_carts(&mut self, i: usize, max: usize) -> Vec<Cart> {
+        let mut out = vec![];
+        let mut k = self.carts.len();
+        while k > 0 && out.len() < max {
+            k -= 1;
+            if self.carts[k].at as usize == i || self.carts[k].shown_at() == i {
+                out.push(self.carts.remove(k));
+            }
+        }
+        out
+    }
+
+    /// Breadth-first search along the track from `from`: each reached tile's previous tile,
+    /// and the tiles in the order they were reached.
+    fn track_search(&self, from: usize) -> (HashMap<usize, usize>, Vec<usize>) {
+        let mut prev = HashMap::new();
+        prev.insert(from, from);
+        let mut order = vec![from];
+        let mut k = 0;
+        while k < order.len() {
+            let cur = order[k];
+            k += 1;
+            for d in [Dir::North, Dir::East, Dir::South, Dir::West] {
+                if let Some(n) = self.neighbor(cur, d)
+                    && !prev.contains_key(&n)
+                    && self.is_track(n)
+                {
+                    prev.insert(n, cur);
+                    order.push(n);
+                }
+            }
+        }
+        (prev, order)
+    }
+
+    /// Carts and depots on the track that `i` is part of.
+    pub fn track_summary(&self, i: usize) -> (usize, usize) {
+        if !self.is_track(i) {
+            return (0, 0);
+        }
+        let (prev, order) = self.track_search(i);
+        let carts = self
+            .carts
+            .iter()
+            .filter(|c| prev.contains_key(&(c.at as usize)))
+            .count();
+        let depots = order
+            .iter()
+            .filter(|&&t| self.depot_unloads(t).is_some())
+            .count();
+        (carts, depots)
+    }
+
+    /// The tiles from `from` to `to`, `to` first and the first step last.
+    fn path_back(prev: &HashMap<usize, usize>, from: usize, to: usize) -> Vec<u32> {
+        let mut v = vec![];
+        let mut cur = to;
+        while cur != from {
+            v.push(cur as u32);
+            cur = prev[&cur];
+        }
+        v
+    }
+
+    /// A path from `from` to the depot `to` along the track.
+    fn path_between(&self, from: usize, to: usize) -> Option<Vec<u32>> {
+        let (prev, _) = self.track_search(from);
+        (to != from && prev.contains_key(&to)).then(|| Self::path_back(&prev, from, to))
+    }
+
+    /// A path from `from` to the next depot on the same track: the one after it in map order,
+    /// wrapping around. Two depots make a shuttle; more are visited in turn.
+    pub fn route(&self, from: usize) -> Option<Vec<u32>> {
+        let (prev, order) = self.track_search(from);
+        let depots: Vec<usize> = order
+            .into_iter()
+            .filter(|&d| d != from && self.depot_unloads(d).is_some())
+            .collect();
+        let to = depots
+            .iter()
+            .copied()
+            .filter(|&d| d > from)
+            .min()
+            .or_else(|| depots.iter().copied().min())?;
+        Some(Self::path_back(&prev, from, to))
+    }
+
+    fn update_carts(&mut self) {
+        let mut carts = std::mem::take(&mut self.carts);
+        for c in &mut carts {
+            self.update_cart(c);
+        }
+        self.carts = carts;
+    }
+
+    fn depart(&self, c: &mut Cart) {
+        match self.route(c.at as usize) {
+            Some(path) => {
+                c.path = path;
+                c.moved = 0.0;
+                c.stopped = 0;
+                c.idle = 0;
+                c.status = CartStatus::Moving;
+            }
+            None => c.status = CartStatus::NoRoute,
+        }
+    }
+
+    /// Moves up to `CART_TRANSFER` items between a stopped cart and its depot.
+    fn transfer(&mut self, c: &mut Cart, depot: usize, unload: bool) -> u32 {
+        let Some(Entity {
+            state: State::Chest { inv, .. },
+            ..
+        }) = self.entities[depot].as_mut()
+        else {
+            return 0;
+        };
+        let mut moved = 0;
+        for _ in 0..CART_TRANSFER {
+            let (from, to, cap) = if unload {
+                (&mut c.cargo, &mut *inv, CRATE_CAP)
+            } else {
+                (&mut *inv, &mut c.cargo, CART_CAP)
+            };
+            if to.total() >= cap {
+                break;
+            }
+            let Some(it) = from.first() else { break };
+            from.remove(it, 1);
+            to.add(it, 1);
+            moved += 1;
+        }
+        moved
+    }
+
+    fn update_cart(&mut self, c: &mut Cart) {
+        let tps = TICKS_PER_SEC;
+        if !c.path.is_empty() {
+            c.status = CartStatus::Moving;
+            c.moved += CART_SPEED / tps as f32;
+            while c.moved >= 1.0 {
+                let next = *c.path.last().unwrap() as usize;
+                if !self.is_track(next) {
+                    // The track ahead was taken up: find another way there, or wait here.
+                    let dest = c.path[0] as usize;
+                    c.moved = 0.0;
+                    c.path = self.path_between(c.at as usize, dest).unwrap_or_default();
+                    if c.path.is_empty() {
+                        c.status = CartStatus::NoRoute;
+                    }
+                    return;
+                }
+                c.path.pop();
+                c.at = next as u32;
+                c.moved -= 1.0;
+                if c.path.is_empty() {
+                    c.moved = 0.0;
+                    c.stopped = 0;
+                    c.idle = 0;
+                    break;
+                }
+            }
+            return;
+        }
+        let here = c.at as usize;
+        c.stopped += 1;
+        let Some(unload) = self.depot_unloads(here) else {
+            // Stopped out on the line, maybe because its depot went away: look for another.
+            if c.stopped % tps == 1 {
+                self.depart(c);
+            }
+            return;
+        };
+        if self.transfer(c, here, unload) > 0 {
+            c.idle = 0;
+            c.status = if unload {
+                CartStatus::Unloading
+            } else {
+                CartStatus::Loading
+            };
+            return;
+        }
+        c.idle += 1;
+        let leave = if unload {
+            c.cargo.is_empty()
+        } else {
+            c.cargo.total() >= CART_CAP
+                || (!c.cargo.is_empty()
+                    && (c.idle >= CART_IDLE_SECS * tps || c.stopped >= CART_MAX_STOP_SECS * tps))
+        };
+        if !leave {
+            c.status = if unload {
+                CartStatus::DepotFull
+            } else {
+                CartStatus::Waiting
+            };
+        } else if c.status != CartStatus::NoRoute || c.idle % tps == 1 {
+            self.depart(c);
+        }
     }
 
     // ---- Serialization helpers ----
@@ -2087,6 +2587,13 @@ impl World {
             transmitted: self.transmitted,
             won_at: self.won_at,
             produced: self.produced.clone(),
+            scenario: if self.scenario.is_standard() {
+                String::new()
+            } else {
+                self.scenario.id.to_string()
+            },
+            explored: (!self.explored.iter().all(|&e| e)).then(|| encode_runs(&self.explored)),
+            carts: self.carts.clone(),
         }
     }
 
@@ -2125,6 +2632,19 @@ impl World {
         w.transmitted = s.transmitted;
         w.won_at = s.won_at;
         w.produced = s.produced;
+        if !s.scenario.is_empty() {
+            w.scenario = Scenario::by_id(&s.scenario)
+                .ok_or_else(|| format!("unknown scenario {}", s.scenario))?;
+        }
+        if let Some(runs) = &s.explored {
+            w.explored = decode_runs(runs, n)?;
+        }
+        for c in &s.carts {
+            if c.at as usize >= n || c.path.iter().any(|&p| p as usize >= n) {
+                return Err("cart position out of range".into());
+            }
+        }
+        w.carts = s.carts;
         Ok(w)
     }
 }
@@ -2145,6 +2665,14 @@ pub struct WorldSave {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub won_at: Option<u64>,
     pub produced: BTreeMap<Item, u64>,
+    /// Empty for free play.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scenario: String,
+    /// Explored tiles as run lengths (see `encode_runs`). Missing in older saves: all explored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explored: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carts: Vec<Cart>,
 }
 
 #[cfg(test)]
@@ -2169,7 +2697,7 @@ mod tests {
 
     fn crate_count(w: &World, x: i32, y: i32, item: Item) -> u32 {
         match &w.entity(x, y).unwrap().state {
-            State::Chest { inv } => inv.count(item),
+            State::Chest { inv, .. } => inv.count(item),
             _ => panic!("not a crate"),
         }
     }
@@ -3088,5 +3616,320 @@ mod tests {
             w.entity(cx, cy).unwrap().state
         );
         assert_eq!(back.tick, 1);
+    }
+
+    // ---- Fog of war ----
+
+    #[test]
+    fn fog_hides_the_map_until_buildings_reveal_it() {
+        let mut w = World::generate(320, 240, 5);
+        let (cx, cy) = w.spawn();
+        assert!(w.is_explored(cx, cy));
+        assert!(w.is_explored(cx + START_REVEAL - 1, cy));
+        assert!(!w.is_explored(cx + START_REVEAL + 6, cy));
+        assert!(w.explored_share() < 0.15);
+        // Find dry land just inside the edge of what's been seen and build a pylon there.
+        let x = (cx..cx + START_REVEAL)
+            .rev()
+            .find(|&x| w.tile(x, cy).unwrap().terrain != Terrain::Water && w.is_explored(x, cy))
+            .unwrap();
+        let far = (x + 8, cy);
+        let err = w.can_place(far.0, far.1, EntityKind::Crate, Dir::North);
+        assert!(err.unwrap_err().contains("Unexplored"));
+        w.place(x, cy, EntityKind::Pylon, Dir::North).unwrap();
+        assert!(w.is_explored(far.0, far.1));
+        // Landfill can't go on water you haven't seen either.
+        assert!(w.fill(cx + 100, cy).is_err());
+    }
+
+    #[test]
+    fn survey_masts_reveal_further_while_powered() {
+        let mut w = flat(80, 80);
+        w.explored.iter_mut().for_each(|e| *e = false);
+        w.reveal(40, 40, 6);
+        w.place(40, 40, EntityKind::SurveyMast, Dir::North).unwrap();
+        assert!(w.is_explored(40 + 8, 40));
+        assert!(!w.is_explored(40 + 12, 40));
+        run(&mut w, 10);
+        // No power: it stays put.
+        assert!(!w.is_explored(40 + 12, 40));
+        power(&mut w, 41, 41);
+        run(&mut w, 10);
+        assert!(w.is_explored(40 + 12, 40));
+        assert!(!w.is_explored(40 + 20, 40));
+        run(&mut w, 100);
+        assert!(w.is_explored(40 + 39, 40));
+        match &w.entity(40, 40).unwrap().state {
+            State::Survey { radius } => assert_eq!(*radius, SURVEY_MAX),
+            s => panic!("{s:?}"),
+        }
+        // Done: it stops drawing power.
+        assert_eq!(w.entity(40, 40).unwrap().status, Status::Idle);
+    }
+
+    #[test]
+    fn fog_survives_a_save_and_old_saves_are_all_explored() {
+        let w = World::generate(120, 90, 8);
+        let save = w.to_save();
+        assert!(save.explored.as_ref().unwrap().len() < 400);
+        let json = serde_json::to_string(&save).unwrap();
+        let back = World::from_save(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(back.explored, w.explored);
+        // A world without fog (like every save before fog existed) writes nothing for it.
+        let open = flat(10, 10);
+        let mut v = serde_json::to_value(open.to_save()).unwrap();
+        assert!(v.get("explored").is_none());
+        v.as_object_mut().unwrap().remove("carts");
+        let back = World::from_save(serde_json::from_value(v).unwrap()).unwrap();
+        assert!(back.explored.iter().all(|&e| e));
+        assert_eq!(
+            decode_runs(&encode_runs(&[true, true, false]), 3).unwrap(),
+            [true, true, false]
+        );
+        assert!(decode_runs(&[2, 5], 3).is_err());
+    }
+
+    // ---- Rail carts ----
+
+    fn rails(w: &mut World, xs: std::ops::RangeInclusive<i32>, y: i32) {
+        for x in xs {
+            w.place(x, y, EntityKind::Rail, Dir::North).unwrap();
+        }
+    }
+
+    fn chest(w: &World, x: i32, y: i32) -> Inventory {
+        match &w.entity(x, y).unwrap().state {
+            State::Chest { inv, .. } => inv.clone(),
+            s => panic!("{s:?}"),
+        }
+    }
+
+    #[test]
+    fn carts_shuttle_cargo_between_depots() {
+        let mut w = flat(60, 12);
+        // Crate → arm → depot A ... rails ... depot B → arm → crate.
+        w.place(1, 5, EntityKind::Crate, Dir::North).unwrap();
+        w.place(2, 5, EntityKind::Arm, Dir::East).unwrap();
+        w.place(3, 5, EntityKind::Depot, Dir::North).unwrap();
+        rails(&mut w, 4..=45, 5);
+        w.place(46, 5, EntityKind::Depot, Dir::North).unwrap();
+        w.place(47, 5, EntityKind::Arm, Dir::East).unwrap();
+        w.place(48, 5, EntityKind::Crate, Dir::North).unwrap();
+        power(&mut w, 2, 7);
+        power(&mut w, 47, 7);
+        assert_eq!(w.toggle_depot(46, 5), Some(true));
+        let src = w.idx(1, 5).unwrap();
+        w.insert(src, Item::FerriteOre, 300, true);
+        w.add_cart(3, 5).unwrap();
+        assert!(w.add_cart(3, 6).is_err());
+        run(&mut w, 120);
+        let got = chest(&w, 48, 5).count(Item::FerriteOre);
+        assert!(got > 60, "only {got} ore arrived");
+        let c = &w.carts[0];
+        assert!(c.cargo.total() <= CART_CAP);
+        // Nothing is lost on the way.
+        let total = chest(&w, 1, 5).total()
+            + chest(&w, 3, 5).total()
+            + chest(&w, 46, 5).total()
+            + chest(&w, 48, 5).total()
+            + c.cargo.total()
+            + [2, 47]
+                .iter()
+                .filter(|&&x| {
+                    matches!(
+                        w.entity(x, 5).unwrap().state,
+                        State::Arm { hand: Some(_), .. }
+                    )
+                })
+                .count() as u32;
+        assert_eq!(total, 300);
+    }
+
+    #[test]
+    fn a_cart_leaves_with_a_part_load_once_the_depot_runs_dry() {
+        let mut w = flat(40, 8);
+        w.place(2, 3, EntityKind::Depot, Dir::North).unwrap();
+        rails(&mut w, 3..=20, 3);
+        w.place(21, 3, EntityKind::Depot, Dir::North).unwrap();
+        w.toggle_depot(21, 3);
+        let a = w.idx(2, 3).unwrap();
+        w.insert(a, Item::Glass, 10, true);
+        w.add_cart(2, 3).unwrap();
+        run(&mut w, 1);
+        assert_eq!(w.carts[0].cargo.count(Item::Glass), 10);
+        assert_eq!(w.carts[0].status, CartStatus::Waiting);
+        // It waits a few seconds in case more turns up, then goes.
+        run(&mut w, CART_IDLE_SECS + 1);
+        assert_eq!(w.carts[0].status, CartStatus::Moving);
+        run(&mut w, 5);
+        assert_eq!(chest(&w, 21, 3).count(Item::Glass), 10);
+        // Empty, it heads back and waits there for cargo.
+        run(&mut w, 5);
+        assert_eq!(w.carts[0].at as usize, a);
+        assert_eq!(w.carts[0].status, CartStatus::Waiting);
+    }
+
+    #[test]
+    fn carts_go_round_more_depots_in_turn_and_wait_when_one_is_full() {
+        let mut w = flat(40, 12);
+        // An L-shaped track with depots at both ends and one on a spur.
+        w.place(2, 2, EntityKind::Depot, Dir::North).unwrap();
+        rails(&mut w, 3..=10, 2);
+        for y in 3..=8 {
+            w.place(10, y, EntityKind::Rail, Dir::North).unwrap();
+        }
+        w.place(10, 9, EntityKind::Depot, Dir::North).unwrap();
+        w.place(11, 5, EntityKind::Depot, Dir::North).unwrap();
+        let (a, b, c) = (
+            w.idx(2, 2).unwrap(),
+            w.idx(10, 9).unwrap(),
+            w.idx(11, 5).unwrap(),
+        );
+        // From A the next depot in map order is the spur (row 5), then the far end (row 9).
+        assert_eq!(w.route(a).unwrap()[0] as usize, c);
+        assert_eq!(w.route(c).unwrap()[0] as usize, b);
+        assert_eq!(w.route(b).unwrap()[0] as usize, a);
+        // The path runs along the track, one tile at a time.
+        let p = w.route(a).unwrap();
+        assert_eq!(p.len(), 8 + 3 + 1);
+        // A full unloading depot keeps the cart waiting.
+        w.toggle_depot(11, 5);
+        w.insert(c, Item::Cog, CRATE_CAP, true);
+        w.insert(a, Item::Coil, 5, true);
+        w.add_cart(2, 2).unwrap();
+        run(&mut w, 12);
+        assert_eq!(w.carts[0].at as usize, c);
+        assert_eq!(w.carts[0].status, CartStatus::DepotFull);
+        let i = w.idx(11, 5).unwrap();
+        for _ in 0..5 {
+            w.take_one(i, Item::Cog);
+        }
+        run(&mut w, 1);
+        assert!(w.carts[0].cargo.is_empty());
+        assert_eq!(chest(&w, 11, 5).count(Item::Coil), 5);
+    }
+
+    #[test]
+    fn carts_find_another_way_or_stop_when_track_is_taken_up() {
+        let mut w = flat(40, 12);
+        w.place(2, 2, EntityKind::Depot, Dir::North).unwrap();
+        rails(&mut w, 3..=29, 2);
+        w.place(30, 2, EntityKind::Depot, Dir::North).unwrap();
+        w.toggle_depot(30, 2);
+        let a = w.idx(2, 2).unwrap();
+        w.insert(a, Item::Steel, CART_CAP, true);
+        w.add_cart(2, 2).unwrap();
+        run(&mut w, 11);
+        assert_eq!(w.carts[0].status, CartStatus::Moving);
+        // Cut the line ahead of it: it turns back to the depot it can still reach and waits.
+        let ahead = w.pos(w.carts[0].at as usize).0 + 4;
+        w.remove(ahead, 2);
+        run(&mut w, 3);
+        assert_eq!(w.carts[0].at as usize, a);
+        assert_eq!(w.carts[0].status, CartStatus::NoRoute);
+        assert_eq!(w.carts[0].cargo.count(Item::Steel), CART_CAP);
+        // A detour round the gap gets it going again.
+        for (x, y) in [(ahead - 1, 3), (ahead, 3), (ahead + 1, 3)] {
+            w.place(x, y, EntityKind::Rail, Dir::North).unwrap();
+        }
+        run(&mut w, 6);
+        assert_eq!(w.carts[0].at as usize, w.idx(30, 2).unwrap());
+        assert_eq!(w.carts[0].status, CartStatus::Unloading);
+    }
+
+    #[test]
+    fn carts_and_depot_settings_survive_a_save() {
+        let mut w = flat(30, 6);
+        w.place(1, 1, EntityKind::Depot, Dir::North).unwrap();
+        rails(&mut w, 2..=20, 1);
+        w.place(21, 1, EntityKind::Depot, Dir::North).unwrap();
+        w.toggle_depot(21, 1);
+        let a = w.idx(1, 1).unwrap();
+        w.insert(a, Item::Lens, CART_CAP, true);
+        w.add_cart(1, 1).unwrap();
+        run(&mut w, 11);
+        assert_eq!(w.carts[0].status, CartStatus::Moving);
+        let json = serde_json::to_string(&w.to_save()).unwrap();
+        let mut back = World::from_save(serde_json::from_str(&json).unwrap()).unwrap();
+        let where_ = |w: &World| -> Vec<(u32, Vec<u32>, f32, Inventory)> {
+            w.carts
+                .iter()
+                .map(|c| (c.at, c.path.clone(), c.moved, c.cargo.clone()))
+                .collect()
+        };
+        assert_eq!(where_(&back), where_(&w));
+        assert_eq!(back.depot_unloads(w.idx(21, 1).unwrap()), Some(true));
+        for _ in 0..100 {
+            w.tick();
+            back.tick();
+        }
+        assert_eq!(back.carts, w.carts);
+        assert_eq!(
+            chest(&back, 21, 1).count(Item::Lens),
+            chest(&w, 21, 1).count(Item::Lens)
+        );
+        // Bad cart positions are refused.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["carts"][0]["at"] = 100_000.into();
+        assert!(World::from_save(serde_json::from_value(v).unwrap()).is_err());
+    }
+
+    // ---- Scenarios ----
+
+    fn ore_near(w: &World, ore: Item, r: i32) -> u32 {
+        let (cx, cy) = w.spawn();
+        let mut n = 0;
+        for y in cy - r..=cy + r {
+            for x in cx - r..=cx + r {
+                if let Some(t) = w.tile(x, y)
+                    && t.ore == Some(ore)
+                    && (x - cx).pow(2) + (y - cy).pow(2) <= r * r
+                {
+                    n += t.amount;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn scenarios_shape_the_map() {
+        let std = World::generate(320, 240, 99);
+        let far = World::generate_scenario(320, 240, 99, Scenario::by_id("far-fields").unwrap());
+        let lean = World::generate_scenario(320, 240, 99, Scenario::by_id("lean").unwrap());
+        for ore in [Item::MalachiteOre, Item::Quartz] {
+            assert!(ore_near(&std, ore, 20) > 0);
+            assert_eq!(ore_near(&far, ore, 45), 0, "{ore:?} near spawn");
+            assert!(ore_near(&far, ore, 70) > 0, "no {ore:?} out there");
+        }
+        assert!(ore_near(&far, Item::FerriteOre, 20) > 0);
+        for ore in ORES {
+            let (s, l) = (ore_near(&std, ore, 20), ore_near(&lean, ore, 20));
+            assert!(l * 2 < s, "{ore:?}: lean {l} vs {s}");
+        }
+    }
+
+    #[test]
+    fn a_production_goal_wins_its_challenge() {
+        let mut w = flat(10, 10);
+        w.scenario = Scenario::by_id("sprint").unwrap();
+        let Goal::Produce(item, n) = w.scenario.goal else {
+            panic!()
+        };
+        w.produced.insert(item, n - 1);
+        w.tick();
+        assert!(!w.won);
+        w.produced.insert(item, n);
+        w.tick();
+        assert!(w.won && w.won_at == Some(1));
+        assert!(w.events.iter().any(|e| e.contains("Challenge complete")));
+        // The scenario is saved with the world.
+        let json = serde_json::to_string(&w.to_save()).unwrap();
+        assert!(json.contains("\"scenario\":\"sprint\""));
+        let back = World::from_save(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(back.scenario.id, "sprint");
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["scenario"] = "nope".into();
+        assert!(World::from_save(serde_json::from_value(v).unwrap()).is_err());
     }
 }

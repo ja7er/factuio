@@ -4,7 +4,8 @@ use crate::game::Game;
 use crate::items::{Dir, EntityKind, Item};
 use crate::recipes::{Category, RecipeId, TechId};
 use crate::records::{Placing, Records};
-use crate::settings::{KeyMap, Settings};
+use crate::scenario::{SCENARIOS, Scenario};
+use crate::settings::{ACTIONS, KeyMap, Settings};
 use crate::tools::{Blueprint, UndoStack, UndoStep, filter_of, recipe_of, rect};
 use crate::world::State;
 use ratatui::crossterm::event::{
@@ -65,6 +66,10 @@ pub enum Modal {
     /// Pick a save slot to save to or load from.
     Slots {
         save: bool,
+        sel: usize,
+    },
+    /// Pick what to play: free play, the tutorial or a challenge.
+    NewGame {
         sel: usize,
     },
 }
@@ -148,6 +153,8 @@ pub struct App {
     /// The `--save` path: slot 1, and where the other slots, the autosave and settings live.
     pub base_save: PathBuf,
     pub seed: Option<u64>,
+    /// The `--scenario` to start, if any.
+    pub scenario: Option<&'static Scenario>,
     pub quit: bool,
     pub title_sel: usize,
     pub title_msg: Option<String>,
@@ -188,6 +195,7 @@ impl App {
             base_save: save_path.clone(),
             save_path,
             seed,
+            scenario: None,
             quit: false,
             title_sel: 0,
             title_msg: None,
@@ -215,10 +223,15 @@ impl App {
     }
 
     /// Adds a win to the speedrun records and remembers how it placed for the victory screen.
-    fn record_win(&mut self, seed: u64, ticks: u64) {
+    fn record_win(&mut self, scenario: &str, seed: u64, ticks: u64) {
         let path = self.records_path();
         let mut r = Records::load(&path);
-        let placing = r.add(seed, ticks);
+        let id = if scenario == Scenario::standard().id {
+            ""
+        } else {
+            scenario
+        };
+        let placing = r.add(id, seed, ticks);
         if let Err(e) = r.save(&path) {
             self.game().log(format!("Couldn't save records: {e}"));
         }
@@ -308,18 +321,50 @@ impl App {
         v
     }
 
+    /// Starts free play, or the `--scenario` given on the command line.
     pub fn new_game(&mut self) {
-        let seed = self.seed.take().unwrap_or_else(|| {
+        let sc = self.scenario.take().unwrap_or(Scenario::standard());
+        self.new_scenario(sc);
+    }
+
+    pub fn new_scenario(&mut self, sc: &'static Scenario) {
+        let seed = sc.seed.or(self.seed.take()).unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(1)
         });
-        let mut g = Game::new(seed);
-        g.log(format!(
-            "New world, seed {seed}. Ores are nearby: look around with the arrow keys."
-        ));
+        let mut g = Game::with_scenario(sc, seed);
+        if sc.is_standard() {
+            g.log(format!(
+                "New world, seed {seed}. Ores are nearby: look around with the arrow keys."
+            ));
+        }
         self.start(g);
+    }
+
+    /// Fastest wins so far, by scenario id (free play is "").
+    pub fn best_times(&self) -> Vec<Option<u64>> {
+        let r = Records::load(&self.records_path());
+        SCENARIOS
+            .iter()
+            .map(|s| r.best(if s.is_standard() { "" } else { s.id }))
+            .collect()
+    }
+
+    /// The key bound to a remappable action, for on-screen hints.
+    pub fn key_label(&self, action: &str) -> String {
+        self.settings
+            .keys
+            .get(action)
+            .cloned()
+            .or_else(|| {
+                ACTIONS
+                    .iter()
+                    .find(|(a, _)| *a == action)
+                    .map(|(_, c)| c.to_string())
+            })
+            .unwrap_or_else(|| action.to_string())
     }
 
     fn start(&mut self, g: Game) {
@@ -417,14 +462,18 @@ impl App {
         for _ in 0..n {
             g.tick();
         }
-        let won = g
-            .victory_pending
-            .then(|| (g.world.seed, g.world.won_at.unwrap_or(g.world.tick)));
+        let won = g.victory_pending.then(|| {
+            (
+                g.world.scenario.id,
+                g.world.seed,
+                g.world.won_at.unwrap_or(g.world.tick),
+            )
+        });
         g.victory_pending = false;
         let tick = g.world.tick;
-        if let Some((seed, ticks)) = won {
+        if let Some((scenario, seed, ticks)) = won {
             self.modal = Modal::Victory;
-            self.record_win(seed, ticks);
+            self.record_win(scenario, seed, ticks);
         }
         let tps = crate::world::TICKS_PER_SEC as u64;
         let every = self.settings.autosave_minutes * 60 * tps;
@@ -528,12 +577,36 @@ impl App {
                 _ => {}
             },
             Modal::Minimap => self.minimap_key(k),
-            Modal::Slots { .. } => {}
+            Modal::Slots { .. } | Modal::NewGame { .. } => self.modal = Modal::None,
+        }
+    }
+
+    fn new_game_key(&mut self, k: KeyEvent, sel: usize) {
+        let n = SCENARIOS.len();
+        match k.code {
+            KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('k') => {
+                self.modal = Modal::NewGame {
+                    sel: (sel + n - 1) % n,
+                }
+            }
+            KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('j') => {
+                self.modal = Modal::NewGame { sel: (sel + 1) % n }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.modal = Modal::None;
+                self.new_scenario(&SCENARIOS[sel.min(n - 1)]);
+            }
+            c if is_close(c, &['n']) => self.modal = Modal::None,
+            _ => {}
         }
     }
 
     fn title_key(&mut self, k: KeyEvent) {
         let items = self.title_items();
+        if let Modal::NewGame { sel } = self.modal {
+            self.new_game_key(k, sel);
+            return;
+        }
         if let Modal::Help { scroll } = self.modal {
             match k.code {
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -566,7 +639,7 @@ impl App {
                 self.title_sel = (self.title_sel + 1) % items.len()
             }
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Char('n') => self.new_game(),
+            KeyCode::Char('n') => self.modal = Modal::NewGame { sel: 0 },
             KeyCode::Char('?') => self.modal = Modal::Help { scroll: 0 },
             KeyCode::Enter | KeyCode::Char(' ') => match items[self.title_sel.min(items.len() - 1)]
             {
@@ -575,7 +648,7 @@ impl App {
                         self.title_msg = Some(e);
                     }
                 }
-                "New game" => self.new_game(),
+                "New game" => self.modal = Modal::NewGame { sel: 0 },
                 "Load game" => self.open_slots(false),
                 "Help" => self.modal = Modal::Help { scroll: 0 },
                 _ => self.quit = true,
@@ -657,6 +730,21 @@ impl App {
     /// Places `item`, or swaps it for a building of the same family that is already there.
     /// Records undo steps. Returns true if anything changed.
     fn build_at(&mut self, x: i32, y: i32, item: Item, dir: Dir, quiet: bool) -> bool {
+        if item == Item::Cart {
+            let g = self.game.as_mut().unwrap();
+            return match g.add_cart(x, y) {
+                Ok(()) => {
+                    self.undo.push(UndoStep::CartAdded { x, y });
+                    true
+                }
+                Err(e) => {
+                    if !quiet {
+                        g.log(e);
+                    }
+                    false
+                }
+            };
+        }
         if item == Item::Landfill {
             let g = self.game.as_mut().unwrap();
             return match g.landfill(x, y) {
@@ -739,9 +827,21 @@ impl App {
         }
     }
 
-    /// Picks up the building at (x, y), recording an undo step.
+    /// Picks up the building at (x, y), recording an undo step. A single pick-up (not `quiet`)
+    /// on a tile with rail carts takes just the carts, so the track stays.
     fn remove_at(&mut self, x: i32, y: i32, quiet: bool) -> bool {
         let g = self.game.as_mut().unwrap();
+        let carts = g.world.idx(x, y).map_or(0, |i| g.world.carts_at(i).count());
+        if carts > 0 && !quiet {
+            let n = g.take_carts(x, y, usize::MAX);
+            g.log(format!(
+                "Picked up {n} rail cart{} with {}",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "its cargo" } else { "their cargo" }
+            ));
+            self.undo.push(UndoStep::CartsTaken { x, y, n });
+            return true;
+        }
         let Some(step) = g.world.entity(x, y).map(|e| UndoStep::removed(x, y, e)) else {
             return false;
         };
@@ -750,7 +850,18 @@ impl App {
                 if !quiet {
                     g.log(format!("Picked up {}", kind.name()));
                 }
-                self.undo.push(step);
+                let steps = if carts > 0 {
+                    vec![UndoStep::CartsTaken { x, y, n: carts }, step]
+                } else {
+                    vec![step]
+                };
+                if self.undo.open {
+                    for s in steps {
+                        self.undo.push(s);
+                    }
+                } else {
+                    self.undo.push_group(steps);
+                }
                 true
             }
             Err(e) => {
@@ -1512,6 +1623,16 @@ impl App {
                     let now = g.world.entity(x, y).map_or(kind, |e| e.kind);
                     g.log(format!("Now a {}", now.name().to_lowercase()));
                 }
+                KeyCode::Char('v') if kind == EntityKind::Depot => {
+                    let g = self.game();
+                    if let Some(unload) = g.world.toggle_depot(x, y) {
+                        g.log(if unload {
+                            "Carts now unload at this depot"
+                        } else {
+                            "Carts now load at this depot"
+                        });
+                    }
+                }
                 KeyCode::Char('f') => match self.game().add_fuel(x, y) {
                     Some((f, n)) => {
                         let what = f.name().to_lowercase();
@@ -2022,11 +2143,15 @@ mod tests {
         a.handle_key(key(KeyCode::Char('q')));
         a.handle_key(key(KeyCode::Char('e')));
         assert!(matches!(a.modal, Modal::Entity { .. }));
+        // Each press adds 10.
+        a.handle_key(key(KeyCode::Char('f')));
         a.handle_key(key(KeyCode::Char('f')));
         match &a.game.as_ref().unwrap().world.entity(3, 3).unwrap().state {
-            State::Furnace { fuel, .. } => assert_eq!(fuel.stock, 30),
+            State::Furnace { fuel, .. } => assert_eq!(fuel.stock, 20),
             _ => unreachable!(),
         }
+        let g = a.game.as_ref().unwrap();
+        assert_eq!(g.player.inventory.count(Item::Lignite), 10);
     }
 
     #[test]
@@ -2086,5 +2211,99 @@ mod tests {
         assert!(g.set_recipe(3, 3, RecipeId::by_id("cog")).is_err());
         assert!(g.set_recipe(5, 3, RecipeId::by_id("resin")).is_err());
         assert!(g.set_recipe(3, 3, RecipeId::by_id("resin")).is_ok());
+    }
+
+    #[test]
+    fn new_game_offers_every_scenario() {
+        let dir = std::env::temp_dir().join(format!("factuio-pick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = App::new(dir.join("save.json"), None, false);
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.modal, Modal::NewGame { sel: 0 });
+        a.handle_key(key(KeyCode::Esc));
+        assert_eq!(a.modal, Modal::None);
+        assert!(a.game.is_none());
+        // Pick the third one: Far fields.
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.modal, Modal::NewGame { sel: 0 });
+        a.handle_key(key(KeyCode::Down));
+        a.handle_key(key(KeyCode::Down));
+        a.handle_key(key(KeyCode::Enter));
+        let g = a.game.as_ref().unwrap();
+        assert_eq!(g.world.scenario.id, "far-fields");
+        assert_eq!(a.best_times().len(), SCENARIOS.len());
+        // A win is recorded under its scenario.
+        a.game.as_mut().unwrap().victory_pending = true;
+        a.game.as_mut().unwrap().world.won_at = Some(1234);
+        a.step();
+        assert_eq!(a.modal, Modal::Victory);
+        let r = Records::load(&a.records_path());
+        assert_eq!(r.best("far-fields"), Some(1234));
+        assert_eq!(r.best(""), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn key_labels_follow_remapped_keys() {
+        let mut a = app();
+        assert_eq!(a.key_label("mine"), "m");
+        let mut s = Settings::default();
+        s.keys.insert("mine".into(), "k".into());
+        a.apply_settings(s);
+        assert_eq!(a.key_label("mine"), "k");
+    }
+
+    #[test]
+    fn carts_go_on_track_and_come_off_with_undo() {
+        let mut a = flat_app();
+        let g = a.game.as_mut().unwrap();
+        g.player.inventory.add(Item::Depot, 2);
+        g.player.inventory.add(Item::Rail, 10);
+        g.player.inventory.add(Item::Cart, 1);
+        g.place(30, 20, Item::Depot, Dir::North).unwrap();
+        a.selected = Some(Item::Cart);
+        a.handle_key(key(KeyCode::Enter));
+        let g = a.game.as_mut().unwrap();
+        assert_eq!(g.world.carts.len(), 1);
+        assert_eq!(g.player.inventory.count(Item::Cart), 0);
+        a.handle_key(key(KeyCode::Char('u')));
+        let g = a.game.as_mut().unwrap();
+        assert!(g.world.carts.is_empty());
+        assert_eq!(g.player.inventory.count(Item::Cart), 1);
+        // x on a depot with a cart takes the cart first, then the depot; undo puts both back.
+        g.add_cart(30, 20).unwrap();
+        a.selected = None;
+        a.handle_key(key(KeyCode::Char('x')));
+        let g = a.game.as_mut().unwrap();
+        assert!(g.world.carts.is_empty());
+        assert!(g.world.entity(30, 20).is_some());
+        a.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(a.game.as_ref().unwrap().world.carts.len(), 1);
+        // Area pick-up takes depot and cart together, and undoes together.
+        a.handle_key(key(KeyCode::Char('z')));
+        a.handle_key(key(KeyCode::Char('x')));
+        let g = a.game.as_ref().unwrap();
+        assert!(g.world.carts.is_empty() && g.world.entity(30, 20).is_none());
+        a.handle_key(key(KeyCode::Char('u')));
+        let g = a.game.as_ref().unwrap();
+        assert_eq!(g.world.carts.len(), 1);
+        assert!(g.world.entity(30, 20).is_some());
+    }
+
+    #[test]
+    fn depots_switch_mode_and_keep_it_through_undo() {
+        let mut a = flat_app();
+        let g = a.game.as_mut().unwrap();
+        g.player.inventory.add(Item::Depot, 1);
+        g.place(30, 20, Item::Depot, Dir::North).unwrap();
+        let i = g.world.idx(30, 20).unwrap();
+        a.handle_key(key(KeyCode::Char('e')));
+        a.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(a.game.as_ref().unwrap().world.depot_unloads(i), Some(true));
+        a.handle_key(key(KeyCode::Esc));
+        a.handle_key(key(KeyCode::Char('x')));
+        assert!(a.game.as_ref().unwrap().world.entity(30, 20).is_none());
+        a.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(a.game.as_ref().unwrap().world.depot_unloads(i), Some(true));
     }
 }

@@ -9,6 +9,7 @@ mod playtest;
 mod recipes;
 mod records;
 mod research;
+mod scenario;
 mod settings;
 mod tools;
 mod ui;
@@ -30,6 +31,7 @@ OPTIONS:
     --new             start a new game immediately
     --continue        load the save file immediately
     --seed <N>        world seed for a new game
+    --scenario <ID>   start a scenario: standard, tutorial, far-fields, lean, sprint
     --save <PATH>     save file location (default: ~/.factuio/save.json)
     --ascii           ASCII-only glyphs (for terminals without Unicode arrows)
     --256             force 256-colour mode
@@ -49,6 +51,7 @@ struct Args {
     new: bool,
     cont: bool,
     seed: Option<u64>,
+    scenario: Option<&'static scenario::Scenario>,
     save: PathBuf,
     ascii: bool,
     color: Option<bool>,
@@ -59,6 +62,7 @@ fn parse_args() -> Result<Args, String> {
         new: false,
         cont: false,
         seed: None,
+        scenario: None,
         save: default_save_path(),
         ascii: false,
         color: None,
@@ -71,6 +75,14 @@ fn parse_args() -> Result<Args, String> {
             "--seed" => {
                 let v = it.next().ok_or("--seed needs a value")?;
                 a.seed = Some(v.parse().map_err(|_| format!("bad seed {v}"))?);
+            }
+            "--scenario" => {
+                let v = it.next().ok_or("--scenario needs a name")?;
+                let names: Vec<&str> = scenario::SCENARIOS.iter().map(|s| s.id).collect();
+                a.scenario =
+                    Some(scenario::Scenario::by_id(&v).ok_or_else(|| {
+                        format!("unknown scenario {v} (try {})", names.join(", "))
+                    })?);
             }
             "--save" => a.save = PathBuf::from(it.next().ok_or("--save needs a path")?),
             "--ascii" => a.ascii = true,
@@ -99,6 +111,7 @@ fn main() {
         ui::set_truecolor(c);
     }
     let mut app = App::new(args.save, args.seed, args.ascii);
+    app.scenario = args.scenario;
     let (settings, warning) = settings::Settings::load_or_create(&app.settings_path());
     let mouse = settings.mouse;
     app.apply_settings(settings);
@@ -110,7 +123,7 @@ fn main() {
             eprintln!("{e}");
             std::process::exit(1);
         }
-    } else if args.new || args.seed.is_some() {
+    } else if args.new || args.seed.is_some() || args.scenario.is_some() {
         app.new_game();
     }
 

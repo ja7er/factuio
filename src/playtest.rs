@@ -15,6 +15,7 @@ fn free(g: &Game, x: i32, y: i32) -> bool {
     g.world
         .tile(x, y)
         .is_some_and(|t| t.terrain != Terrain::Water)
+        && g.world.is_explored(x, y)
         && g.world.entity(x, y).is_none()
 }
 
