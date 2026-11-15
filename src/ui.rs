@@ -38,7 +38,9 @@ fn col((r, g, b): Rgb) -> Color {
     if TRUECOLOR.load(Ordering::Relaxed) {
         Color::Rgb(r, g, b)
     } else {
-        // Map onto the xterm 256-colour cube.
+        // The xterm 256-colour cube, with its greyscale ramp for colours the cube would turn
+        // black (grass, fog, night) and for near-greys. Tinted colours stay in the cube so
+        // ore patches keep their hue.
         let q = |v: u8| -> u8 {
             if v < 48 {
                 0
@@ -48,7 +50,26 @@ fn col((r, g, b): Rgb) -> Color {
                 (v - 35) / 40
             }
         };
-        Color::Indexed(16 + 36 * q(r) + 6 * q(g) + q(b))
+        const LEVELS: [i32; 6] = [0, 95, 135, 175, 215, 255];
+        let dist = |c: (i32, i32, i32)| {
+            (c.0 - r as i32).pow(2) + (c.1 - g as i32).pow(2) + (c.2 - b as i32).pow(2)
+        };
+        let (qr, qg, qb) = (q(r), q(g), q(b));
+        let cube = (
+            LEVELS[qr as usize],
+            LEVELS[qg as usize],
+            LEVELS[qb as usize],
+        );
+        let avg = (r as i32 + g as i32 + b as i32) / 3;
+        let k = ((avg - 3) / 10).clamp(0, 23);
+        let grey = 8 + 10 * k;
+        let spread = r.max(g).max(b) - r.min(g).min(b);
+        let dark = qr + qg + qb == 0;
+        if (dark || spread <= 12) && dist((grey, grey, grey)) < dist(cube) {
+            Color::Indexed(232 + k as u8)
+        } else {
+            Color::Indexed(16 + 36 * qr + 6 * qg + qb)
+        }
     }
 }
 
@@ -121,6 +142,9 @@ fn entity_bg(k: EntityKind) -> Rgb {
         EntityKind::Sifter => (104, 92, 52),
         EntityKind::ChemPlant => (34, 96, 70),
         EntityKind::BatteryBank => (64, 84, 36),
+        EntityKind::Rail => (48, 42, 36),
+        EntityKind::Depot => (72, 56, 96),
+        EntityKind::SurveyMast => (36, 84, 76),
         EntityKind::Arm | EntityKind::SwiftArm | EntityKind::LongArm | EntityKind::FilterArm => {
             (40, 40, 40)
         }
@@ -156,9 +180,57 @@ fn status_color(s: Status) -> Color {
 
 type Cell2 = [(char, Rgb, Rgb, bool); 2];
 
+const RAIL_FG: Rgb = (190, 170, 140);
+const CART_RGB: Rgb = (255, 200, 90);
+
+/// A rail tile joined to the track on the sides set in `mask` (N=1, E=2, S=4, W=8).
+/// The left cell carries the bend or junction and the right one runs on east.
+fn rail_cells(mask: u8, ascii: bool, bg: Rgb) -> Cell2 {
+    let (n, e, s, w) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0, mask & 8 != 0);
+    let vertical = n || s;
+    let horizontal = e || w;
+    let left = if ascii {
+        match (vertical, horizontal) {
+            (true, true) => '+',
+            (true, false) => '|',
+            _ => '=',
+        }
+    } else {
+        match (n, e, s, w) {
+            (true, true, true, true) => '╬',
+            (true, true, true, false) => '╠',
+            (true, false, true, true) => '╣',
+            (false, true, true, true) => '╦',
+            (true, true, false, true) => '╩',
+            (true, true, false, false) => '╚',
+            (true, false, false, true) => '╝',
+            (false, true, true, false) => '╔',
+            (false, false, true, true) => '╗',
+            _ if vertical && !horizontal => '║',
+            _ => '═',
+        }
+    };
+    let right = if e || !vertical {
+        if ascii { '=' } else { '═' }
+    } else {
+        ' '
+    };
+    [(left, RAIL_FG, bg, false), (right, RAIL_FG, bg, false)]
+}
+
+/// A cart drawn over its tile: the cart and what it carries.
+fn cart_cells(c: &crate::world::Cart, ascii: bool, bg: Rgb) -> Cell2 {
+    let body = (if ascii { 'O' } else { '■' }, CART_RGB, bg, true);
+    let load = match c.cargo.first() {
+        Some(i) => (i.glyph(), item_rgb(i), bg, true),
+        None => (if ascii { '.' } else { '·' }, (150, 150, 150), bg, false),
+    };
+    [body, load]
+}
+
 /// The two characters used to draw an entity, with fg/bg colours and bold flag.
-/// `transmitted` is the world's Uplink progress, drawn on Uplink arrays.
-fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32) -> Cell2 {
+/// `transmitted` is the world's Uplink progress, drawn on Uplink arrays; `tick` animates.
+fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32, tick: u64) -> Cell2 {
     let bg = if e.kind.is_arm() {
         bg_under
     } else {
@@ -263,12 +335,34 @@ fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32) -> Cel
                 second,
             ]
         }
-        State::Chest { inv } => {
+        State::Chest { unload, .. } if e.kind == EntityKind::Depot => {
+            let (c, fg) = if *unload {
+                ('-', (255, 170, 110))
+            } else {
+                ('+', (140, 230, 140))
+            };
+            [('R', (230, 210, 255), bg, true), (c, fg, bg, true)]
+        }
+        State::Chest { inv, .. } => {
             let second = match inv.first() {
                 Some(i) => (i.glyph(), item_rgb(i), bg, false),
                 None => (dot, dim, bg, false),
             };
             [('C', (240, 220, 180), bg, true), second]
+        }
+        State::Rail => rail_cells(0, ascii, bg),
+        State::Survey { .. } => {
+            let spin = if ascii {
+                ['|', '/', '-', '\\']
+            } else {
+                ['◜', '◝', '◞', '◟']
+            };
+            let second = if e.status == Status::Working {
+                (spin[(tick / 5 % 4) as usize], (140, 255, 220), bg, true)
+            } else {
+                (dot, dim, bg, false)
+            };
+            [letter('V'), second]
         }
         State::Generator { .. } => {
             let s = match e.status {
@@ -391,6 +485,9 @@ impl Widget for MapView<'_> {
             vec![]
         };
         let night = (1.0 - world.daylight()) * 0.45;
+        // Carts by the tile they're drawn on (the newest wins where several share one).
+        let carts: std::collections::HashMap<usize, &crate::world::Cart> =
+            world.carts.iter().map(|c| (c.shown_at(), c)).collect();
         let area_sel = self
             .app
             .area_anchor
@@ -409,6 +506,7 @@ impl Widget for MapView<'_> {
                     }
                     continue;
                 };
+                let explored = world.is_explored(x, y);
                 let mut bg = tile
                     .ore
                     .map(ore_bg)
@@ -451,8 +549,31 @@ impl Widget for MapView<'_> {
                 };
 
                 if let Some(e) = world.entity(x, y) {
-                    cells = entity_cells(e, ascii, bg, world.transmitted);
+                    cells = entity_cells(e, ascii, bg, world.transmitted, world.tick);
+                    if e.kind == EntityKind::Rail {
+                        let mut mask = 0;
+                        for (bit, (dx, dy)) in
+                            [(1, (0, -1)), (2, (1, 0)), (4, (0, 1)), (8, (-1, 0))]
+                        {
+                            if world
+                                .entity(x + dx, y + dy)
+                                .is_some_and(|n| n.kind.is_track())
+                            {
+                                mask |= bit;
+                            }
+                        }
+                        cells = rail_cells(mask, ascii, cells[0].2);
+                    }
                     bg = cells[0].2;
+                }
+                if let Some(c) = world.idx(x, y).and_then(|i| carts.get(&i)) {
+                    cells = cart_cells(c, ascii, bg);
+                }
+                if !explored {
+                    let fog = (10, 10, 14);
+                    let c = if ascii { ' ' } else { '░' };
+                    cells = [(c, (22, 22, 28), fog, false), (c, (22, 22, 28), fog, false)];
+                    bg = fog;
                 }
 
                 // Highlights.
@@ -519,7 +640,7 @@ impl Widget for MapView<'_> {
                         let ok = world.can_place(x, y, c.kind, c.dir).is_ok()
                             || world.entity(x, y).is_some_and(|e| e.kind == c.kind);
                         let g = ghost_entity(c.kind, c.dir);
-                        cells = entity_cells(&g, ascii, bg, world.transmitted);
+                        cells = entity_cells(&g, ascii, bg, world.transmitted, world.tick);
                         let gbg = if ok { (60, 90, 150) } else { (150, 40, 40) };
                         for cell in &mut cells {
                             cell.2 = gbg;
@@ -543,16 +664,25 @@ impl Widget for MapView<'_> {
                         let ok = world.can_place(x, y, k, self.app.place_dir).is_ok()
                             && self.game.player.inventory.count(k.item()) > 0;
                         let g = ghost_entity(k, self.app.place_dir);
-                        cells = entity_cells(&g, ascii, bg, world.transmitted);
+                        cells = entity_cells(&g, ascii, bg, world.transmitted, world.tick);
                         let gbg = if ok { (60, 90, 150) } else { (150, 40, 40) };
                         for c in &mut cells {
                             c.2 = gbg;
                         }
                     } else if self.app.selected == Some(Item::Landfill) {
-                        let ok = tile.terrain == Terrain::Water
+                        let ok = explored
+                            && tile.terrain == Terrain::Water
                             && self.game.player.inventory.count(Item::Landfill) > 0;
                         let gbg = if ok { (120, 104, 70) } else { (150, 40, 40) };
                         cells = [('=', (240, 220, 170), gbg, true); 2];
+                    } else if self.app.selected == Some(Item::Cart) {
+                        let ok = world.entity(x, y).is_some_and(|e| e.kind.is_track())
+                            && self.game.player.inventory.count(Item::Cart) > 0;
+                        let gbg = if ok { (60, 90, 150) } else { (150, 40, 40) };
+                        cells = [
+                            (if ascii { 'O' } else { '■' }, CART_RGB, gbg, true),
+                            (' ', CART_RGB, gbg, false),
+                        ];
                     } else {
                         for c in &mut cells {
                             c.2 = blend(c.2, (230, 230, 230), 0.55);
@@ -654,6 +784,112 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let Modal::Slots { save, sel } = app.modal {
         draw_slots(f, app, save, sel);
     }
+    if let Modal::NewGame { sel } = app.modal {
+        draw_new_game(f, app, sel);
+    }
+}
+
+fn draw_new_game(f: &mut Frame, app: &App, sel: usize) {
+    let scenarios = crate::scenario::SCENARIOS;
+    let area = centered(
+        f.area(),
+        72,
+        (scenarios.len() as u16 * 2 + 9).min(f.area().height),
+    );
+    f.render_widget(Clear, area);
+    let block = modal_block("New game");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let best = app.best_times();
+    let mut lines = vec![];
+    for (k, sc) in scenarios.iter().enumerate() {
+        let mut spans = vec![Span::raw(format!("{:<12}", sc.name))];
+        let detail = match (sc.seed, best[k]) {
+            (_, Some(b)) => format!("best {}", crate::game::clock(b)),
+            (None, None) => "random map".to_string(),
+            (Some(_), None) if sc.tutorial => "guided".to_string(),
+            (Some(seed), None) => format!("seed {seed}"),
+        };
+        spans.push(dim(format!("  {detail}")));
+        lines.push(list_line(spans, k == sel));
+    }
+    lines.push(Line::from(""));
+    let sc = &scenarios[sel.min(scenarios.len() - 1)];
+    lines.push(Line::from(Span::styled(
+        sc.blurb,
+        Style::default().fg(col((255, 220, 140))),
+    )));
+    lines.push(Line::from(dim(format!("Goal: {}.", sc.goal_text()))));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        key("Enter"),
+        dim(" start  "),
+        key("Esc"),
+        dim(" back"),
+    ]));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+/// The current tutorial step, in a card over the top right of the map.
+/// How many lines greedy word wrapping at `width` columns turns `text` into.
+fn wrapped_lines(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut lines = 1;
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let n = word.chars().count();
+        if used == 0 {
+            used = n;
+        } else if used + 1 + n <= width {
+            used += 1 + n;
+        } else {
+            lines += 1;
+            used = n;
+        }
+        // A word longer than the line spills over.
+        while used > width {
+            lines += 1;
+            used -= width;
+        }
+    }
+    lines
+}
+
+fn draw_tutorial(f: &mut Frame, app: &App, game: &Game, map: Rect) {
+    let Some((k, step)) = game.tutorial_step() else {
+        return;
+    };
+    let text = crate::scenario::fill_keys(step.text, |a| app.key_label(a));
+    let w = map.width.saturating_sub(2).min(46);
+    if w < 20 {
+        return;
+    }
+    let body_w = (w - 4) as usize;
+    let h = (wrapped_lines(&text, body_w) as u16 + 2).min(map.height);
+    let area = Rect::new(map.x + map.width - w - 1, map.y + 1, w, h);
+    f.render_widget(Clear, area);
+    let title = format!(
+        " Tutorial {}/{}: {} ",
+        k + 1,
+        crate::scenario::STEPS.len(),
+        step.title
+    );
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(col((120, 200, 255))))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(col((120, 200, 255)))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(col((16, 22, 34))));
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .block(block.padding(ratatui::widgets::Padding::horizontal(1))),
+        area,
+    );
 }
 
 const LOGO: &[&str] = &[
@@ -708,7 +944,7 @@ fn draw_title(f: &mut Frame, app: &App) {
         app.save_path.display()
     ))));
     lines.push(Line::from(dim(
-        "↑/↓ choose · Enter select · n new game · q quit",
+        "↑/↓ choose · Enter select · n new game or challenge · q quit",
     )));
     let h = lines.len() as u16;
     let y = area.height.saturating_sub(h) / 2;
@@ -731,6 +967,9 @@ fn draw_game(f: &mut Frame, app: &App, game: &Game) {
 
     draw_top(f, app, game, top);
     f.render_widget(MapView { app, game }, map_area);
+    if app.modal == Modal::None {
+        draw_tutorial(f, app, game, map_area);
+    }
     draw_sidebar(f, app, game, side);
     draw_hotbar(f, app, game, hot);
     draw_messages(f, app, game, msg);
@@ -785,6 +1024,22 @@ fn draw_top(f: &mut Frame, app: &App, game: &Game, area: Rect) {
         time_of_day(game.world.daylight(), app.ascii),
         Span::raw("  "),
     ];
+    let sc = game.world.scenario;
+    if !sc.is_standard() {
+        let label = match sc.goal {
+            crate::scenario::Goal::Produce(item, n) => format!(
+                "{} {}/{n}",
+                sc.name,
+                game.world.produced.get(&item).copied().unwrap_or(0).min(n)
+            ),
+            crate::scenario::Goal::Uplink => sc.name.to_string(),
+        };
+        spans.push(Span::styled(
+            label,
+            Style::default().fg(col((230, 170, 255))),
+        ));
+        spans.push(Span::raw("  "));
+    }
     if app.paused {
         spans.push(Span::styled(
             "PAUSED",
@@ -1084,9 +1339,50 @@ fn entity_detail(
             lines.push(Line::from("Output:"));
             lines.extend(inv_lines(output, 2));
         }
-        State::Chest { inv } => {
+        State::Chest { inv, unload } => {
+            if e.kind == EntityKind::Depot {
+                lines.push(Line::from(if *unload {
+                    "Carts unload here"
+                } else {
+                    "Carts load here"
+                }));
+                if rich {
+                    lines.push(Line::from(dim("v switches loading and unloading")));
+                }
+            }
             lines.push(Line::from(format!("{}/{} items", inv.total(), CRATE_CAP)));
             lines.extend(inv_lines(inv, if rich { 12 } else { 6 }));
+        }
+        State::Rail => {
+            let (carts, depots) = w.track_summary(i);
+            let plural = |n: usize, one: &str| match n {
+                1 => format!("1 {one}"),
+                n => format!("{n} {one}s"),
+            };
+            lines.push(Line::from(dim(format!(
+                "This track: {}, {}",
+                plural(depots, "depot"),
+                plural(carts, "cart")
+            ))));
+            if depots < 2 {
+                lines.push(Line::from(dim("Carts need two depots to shuttle between")));
+            }
+        }
+        State::Survey { radius } => {
+            lines.push(Line::from(format!(
+                "Surveyed {:.0} of {:.0} tiles around",
+                radius,
+                crate::world::SURVEY_MAX
+            )));
+            lines.push(Line::from(bar(
+                radius / crate::world::SURVEY_MAX,
+                16,
+                ascii,
+            )));
+            lines.push(Line::from(dim(format!(
+                "{:.0}% of the map explored",
+                w.explored_share() * 100.0
+            ))));
         }
         State::Generator { fuel, water, .. } => {
             lines.push(fuel_line(fuel));
@@ -1153,23 +1449,61 @@ fn entity_detail(
     }
 }
 
+/// Lines describing the carts on tile `i`.
+fn cart_lines(w: &crate::world::World, i: usize, lines: &mut Vec<Line<'static>>) {
+    for c in w.carts_at(i) {
+        lines.push(Line::from(vec![
+            Span::styled("Rail cart", Style::default().add_modifier(Modifier::BOLD)),
+            dim(format!(
+                " {}/{} · {}",
+                c.cargo.total(),
+                crate::world::CART_CAP,
+                c.status.label()
+            )),
+        ]));
+        if let Some(d) = c.destination() {
+            let (dx, dy) = w.pos(d);
+            lines.push(Line::from(dim(format!(
+                "  heading for the depot at ({dx}, {dy}), {} tiles",
+                c.path.len()
+            ))));
+        }
+        for (it, n) in c.cargo.iter().take(3) {
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {n:>4} ")),
+                item_span(it),
+            ]));
+        }
+    }
+}
+
 fn draw_sidebar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
     let mut lines: Vec<Line<'static>> = vec![];
     let (x, y) = game.player.cursor;
     let w = &game.world;
     let tile = w.tile(x, y).unwrap();
     lines.push(header("Cursor"));
+    let explored = w.is_explored(x, y);
     let terr = match tile.terrain {
+        _ if !explored => "Unexplored",
         Terrain::Grass => "Grass",
         Terrain::Sand => "Sand",
         Terrain::Water => "Water",
     };
     lines.push(Line::from(format!("({x}, {y}) {terr}")));
-    if let Some(o) = tile.ore {
+    if let Some(o) = tile.ore.filter(|_| explored) {
         lines.push(Line::from(vec![
             item_span(o),
             Span::raw(format!(" × {}", tile.amount)),
         ]));
+    }
+    if !explored {
+        lines.push(Line::from(dim(
+            "Build nearby to see further, or put up a survey mast.",
+        )));
+    }
+    if let Some(i) = w.idx(x, y) {
+        cart_lines(w, i, &mut lines);
     }
     if w.entity(x, y).is_some() {
         lines.push(Line::from(""));
@@ -1276,7 +1610,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
                 }
                 lines.push(Line::from(dim(match k {
                     Some(k) => k.description(),
-                    None => "Turns the water tile under the cursor into sand.",
+                    None => placeable_desc(item),
                 })));
             }
             None => lines.push(Line::from(dim("nothing selected (1-0, b)"))),
@@ -1424,6 +1758,16 @@ fn list_line(text: Vec<Span<'static>>, selected: bool) -> Line<'static> {
         );
     }
     l
+}
+
+/// What a placeable item that isn't a building does.
+fn placeable_desc(item: Item) -> &'static str {
+    match item {
+        Item::Cart => {
+            "Put it on a depot or rail. It shuttles between the depots on its track, carrying 400 items."
+        }
+        _ => "Place it on a water tile to turn it into sand you can build on.",
+    }
 }
 
 /// Keeps the selected row visible in a list of `height` rows.
@@ -1606,7 +1950,7 @@ fn draw_build(f: &mut Frame, game: &Game, sel: usize) {
     let Some(kind) = items[sel].building() else {
         let lines = vec![
             header(items[sel].name()),
-            Line::from("Place it on a water tile to turn it into sand you can build on."),
+            Line::from(placeable_desc(items[sel])),
             Line::from(""),
             Line::from(vec![key("Enter"), dim(" select for placing")]),
             Line::from(vec![key("1-0"), dim(" put on hotbar slot")]),
@@ -1812,6 +2156,9 @@ fn draw_entity_panel(
         Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(inner);
     let mut lines = vec![];
     entity_detail(app, game, x, y, &mut lines, true);
+    if let Some(i) = game.world.idx(x, y) {
+        cart_lines(&game.world, i, &mut lines);
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(dim(e.kind.description())));
     f.render_widget(
@@ -1829,7 +2176,7 @@ fn draw_entity_panel(
                 Span::raw(" insert from inventory"),
             ]));
             if e.kind.fuel_draw() > 0.0 || matches!(e.state, State::Generator { .. }) {
-                r.push(Line::from(vec![key("f"), Span::raw(" add fuel")]));
+                r.push(Line::from(vec![key("f"), Span::raw(" add 10 fuel")]));
             }
             if e.kind.module_slots() > 0 && !e.modules.is_empty() {
                 r.push(Line::from(vec![key("m"), Span::raw(" take modules out")]));
@@ -1849,6 +2196,12 @@ fn draw_entity_panel(
                 r.push(Line::from(vec![
                     key("v"),
                     Span::raw(" switch entrance / exit"),
+                ]));
+            }
+            if e.kind == EntityKind::Depot {
+                r.push(Line::from(vec![
+                    key("v"),
+                    Span::raw(" switch loading / unloading"),
                 ]));
             }
             r.push(Line::from(vec![key("x"), Span::raw(" pick up building")]));
@@ -2090,6 +2443,9 @@ fn draw_minimap(f: &mut Frame, app: &App, game: &Game) {
         let mut terrain = None;
         for y in y0..(y0 + sy).min(w.height) {
             for x in x0..(x0 + sx).min(w.width) {
+                if !w.is_explored(x, y) {
+                    continue;
+                }
                 if let Some(e) = w.entity(x, y) {
                     return blend(entity_bg(e.kind), (255, 255, 255), 0.25);
                 }
@@ -2103,9 +2459,19 @@ fn draw_minimap(f: &mut Frame, app: &App, game: &Game) {
         match (ore, terrain) {
             (Some(o), _) => blend(ore_bg(o), item_rgb(o), 0.3),
             (None, Some(t)) => terrain_bg(t),
-            _ => (0, 0, 0),
+            // Nothing explored in this block.
+            _ => (6, 6, 8),
         }
     };
+    let carts: std::collections::HashSet<(i32, i32)> = w
+        .carts
+        .iter()
+        .map(|c| {
+            let (x, y) = w.pos(c.shown_at());
+            // Column, and half-row (top halves even, bottom halves odd).
+            (x / sx, y / sy)
+        })
+        .collect();
     let (cx, cy) = game.player.cursor;
     let buf = f.buffer_mut();
     for r in 0..rows {
@@ -2117,6 +2483,12 @@ fn draw_minimap(f: &mut Frame, app: &App, game: &Game) {
             } else {
                 (12, 12, 16)
             };
+            if carts.contains(&(c, r * 2)) {
+                top = CART_RGB;
+            }
+            if carts.contains(&(c, r * 2 + 1)) {
+                bot = CART_RGB;
+            }
             let in_cell = |yy: i32| cx >= x && cx < x + sx && cy >= yy && cy < yy + sy;
             if in_cell(y) {
                 top = (255, 255, 255);
@@ -2137,7 +2509,11 @@ fn draw_minimap(f: &mut Frame, app: &App, game: &Game) {
     }
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            dim(format!("1 cell = {sx}×{} tiles · ", sy * 2)),
+            dim(format!(
+                "1 cell = {sx}×{} tiles · {:.0}% explored · ",
+                sy * 2,
+                w.explored_share() * 100.0
+            )),
             key("arrows"),
             dim(" move cursor  "),
             key("click"),
@@ -2169,13 +2545,24 @@ fn draw_confirm(f: &mut Frame, question: &str) {
 fn draw_victory(f: &mut Frame, app: &App, game: &Game) {
     let area = centered(f.area(), 64, 15);
     f.render_widget(Clear, area);
-    let block = modal_block("Transmission complete");
+    let sc = game.world.scenario;
+    let uplink = sc.goal == crate::scenario::Goal::Uplink;
+    let block = modal_block(if uplink {
+        "Transmission complete"
+    } else {
+        "Challenge complete"
+    });
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let banner = if uplink {
+        "★  The Uplink array is transmitting  ★".to_string()
+    } else {
+        format!("★  {}: done  ★", sc.name)
+    };
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "★  The Uplink array is transmitting  ★",
+            banner,
             Style::default()
                 .fg(col((255, 230, 90)))
                 .add_modifier(Modifier::BOLD),
@@ -2195,12 +2582,14 @@ fn draw_victory(f: &mut Frame, app: &App, game: &Game) {
     if let Some(p) = &app.last_win {
         let gold = Style::default().fg(col((255, 230, 90)));
         lines.push(Line::from(""));
+        // Challenges are one fixed map, so their seed best is their best.
+        let fixed = sc.seed.is_some();
         if p.is_record() && p.prev_best.is_some() {
             lines.push(Line::from(Span::styled("New personal best!", gold)));
-        } else if p.is_seed_record() && p.prev_seed_best.is_some() {
+        } else if !fixed && p.is_seed_record() && p.prev_seed_best.is_some() {
             lines.push(Line::from(Span::styled("New best on this seed!", gold)));
         }
-        if let Some(b) = p.prev_seed_best {
+        if let Some(b) = p.prev_seed_best.filter(|_| !fixed) {
             lines.push(Line::from(dim(format!(
                 "Best before on seed {}: {}",
                 game.world.seed,
@@ -2209,16 +2598,21 @@ fn draw_victory(f: &mut Frame, app: &App, game: &Game) {
         }
         if let Some(b) = p.prev_best {
             lines.push(Line::from(dim(format!(
-                "Best before on any seed: {}",
+                "Best before{}: {}",
+                if fixed { "" } else { " on any seed" },
                 crate::game::clock(b)
             ))));
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(dim(format!(
-        "Keep the Uplink fed: milestone {} makes it harder, and endless research awaits.",
-        game.world.next_milestone()
-    ))));
+    lines.push(Line::from(dim(if uplink {
+        format!(
+            "Keep the Uplink fed: milestone {} makes it harder, and endless research awaits.",
+            game.world.next_milestone()
+        )
+    } else {
+        "Keep building if you like, or try another challenge from the title screen.".to_string()
+    })));
     lines.push(Line::from(dim("Press Enter to continue.")));
     f.render_widget(Paragraph::new(lines).centered(), inner);
 }
@@ -2232,12 +2626,26 @@ GOAL
   win the Uplink keeps transmitting toward ever harder milestones, and
   two endless techs keep making mining and arms faster.
 
+NEW GAME
+  Free play        a new random world (or --seed N)
+  Tutorial         a guided first hour, one step at a time
+  Far fields       no malachite or quartz near spawn: haul it in by rail
+  Lean ores        the starter patches hold a third of the usual ore
+  Sprint           make 60 Beta datapacks in fabricators, against the clock
+  Challenges use the same map for everyone and keep their own records.
+  From the command line: --scenario tutorial (far-fields, lean, sprint).
+
 MOVING AROUND
   Arrows / WASD        move the cursor (Shift or capital WASD: 8 tiles)
   M                    map overview (click or move, Enter to return)
   n                    jump to the next building with a problem
   The map scrolls when the cursor nears an edge. The sidebar describes
   what's under the cursor and lists alerts.
+  The world is 320 x 240 tiles and starts out unexplored beyond the area
+  around spawn (░). Every building lets you see a few tiles around it
+  (pylons further), so building outward explores; a survey mast
+  (Surveying) reveals up to 50 tiles around itself while powered. You
+  can only build, landfill and mine where you've explored.
 
 MOUSE
   left click           place the selected building, or inspect
@@ -2267,6 +2675,10 @@ BUILDING
   Tunnels              place a tunnel belt, then another up to 5 tiles
                        further on facing the same way: the second becomes
                        the exit. Items travel underground between them.
+  Rails                (Railways) lay rails with paint mode or a drag; they
+                       join up with the rails and depots beside them. Put a
+                       rail cart (b, then select it) on a depot. x on a
+                       cart picks it up with its cargo.
   o                    toggle the power coverage overlay
 
 INTERACTING
@@ -2275,6 +2687,7 @@ INTERACTING
                          r choose recipe (fabricator) or rotate, x pick up,
                          f choose the item (filter arm),
                          v swap entrance and exit (tunnel belt),
+                         v switch loading / unloading (depot),
                          m take modules back out
   m                    mine the ore under the cursor by hand (keep still)
   c / i / Tab          crafting and inventory
@@ -2315,6 +2728,10 @@ MAP LEGEND
   L          lab                    U  uplink array
   W→ Q→      pump / sifter          T  steam turbine   H  chem plant
   A▅         battery bank (bar shows its charge)
+  ═╗ ║       rails (ASCII = | +)    R+ R-  depot: carts load / unload
+  ■g         rail cart and its cargo (ASCII O)
+  V◜         survey mast (spins while it surveys)
+  ░          unexplored
   A bold white letter means working; red means something is wrong.
 
 ITEMS ON BELTS
@@ -2350,6 +2767,13 @@ HOW THINGS WORK
   fabricators, chem plants and labs by hand (e, i): speed is +50% for
   +50% power, productivity gives a free batch every ten at 15% less
   speed.
+  Rail carts run at 8 tiles a second and carry 400 items. A cart visits
+  the depots on its track in turn (two depots make a shuttle). At a
+  loading depot it fills up and leaves when full, when nothing has
+  come for 5 seconds, or after 30 seconds; at an unloading depot it
+  empties out, waiting if the depot is full. Depots hold 800 items and
+  arms put in and take out like a crate. Carts pass through each
+  other. Ore patches far from spawn are much richer.
 
 GETTING STARTED
   1. Find ore near spawn. Place a Digger (3) on lignite facing a Crate,
@@ -2499,7 +2923,7 @@ mod tests {
         for ascii in [false, true] {
             for k in EntityKind::ALL {
                 let e = ghost_entity(k, Dir::East);
-                let cells = entity_cells(&e, ascii, (0, 0, 0), 0);
+                let cells = entity_cells(&e, ascii, (0, 0, 0), 0, 0);
                 assert!(cells.iter().all(|c| c.0 != '\0'), "{k:?}");
                 if ascii {
                     assert!(cells.iter().all(|c| c.0.is_ascii()), "{k:?} {cells:?}");
@@ -2524,6 +2948,9 @@ mod tests {
             (Item::Sifter, 5, 5),
             (Item::ChemPlant, 8, 8),
             (Item::BatteryBank, 10, 8),
+            (Item::Depot, 14, 3),
+            (Item::Rail, 15, 3),
+            (Item::SurveyMast, 18, 8),
         ];
         for &(item, x, y) in &spots {
             g.player.inventory.add(item, 1);
@@ -2588,9 +3015,26 @@ mod tests {
     }
 
     #[test]
+    fn word_wrap_counts_lines() {
+        assert_eq!(wrapped_lines("", 10), 1);
+        assert_eq!(wrapped_lines("one two", 7), 1);
+        assert_eq!(wrapped_lines("one two", 6), 2);
+        assert_eq!(wrapped_lines("aaaa bbbb cccc", 9), 2);
+        assert_eq!(wrapped_lines("abcdefghij", 4), 3);
+    }
+
+    #[test]
     fn color_fallback_maps_to_indexed() {
         set_truecolor(false);
-        assert!(matches!(col((255, 0, 0)), Color::Indexed(_)));
+        assert_eq!(col((255, 0, 0)), Color::Indexed(196));
+        assert_eq!(col((0, 0, 0)), Color::Indexed(16));
+        assert_eq!(col((255, 255, 255)), Color::Indexed(231));
+        // Dark ground and fog land on the greyscale ramp, apart from each other and from black.
+        let grass = col(terrain_bg(Terrain::Grass));
+        let fog = col((10, 10, 14));
+        assert!(matches!(grass, Color::Indexed(232..)));
+        assert!(matches!(fog, Color::Indexed(232..)));
+        assert_ne!(grass, fog);
         set_truecolor(true);
         assert_eq!(col((1, 2, 3)), Color::Rgb(1, 2, 3));
     }
@@ -2692,5 +3136,117 @@ mod tests {
             html.push_str("</pre></body></html>");
             std::fs::write(format!("{dir}/{name}.html"), html).unwrap();
         }
+    }
+
+    #[test]
+    fn the_new_game_picker_lists_every_scenario() {
+        let dir = std::env::temp_dir().join(format!("factuio-ui-pick-{}", std::process::id()));
+        let mut a = App::new(dir.join("save.json"), None, false);
+        a.modal = Modal::NewGame { sel: 4 };
+        let s = render(&a, 100, 30);
+        for sc in crate::scenario::SCENARIOS {
+            assert!(s.contains(sc.name), "{}", sc.name);
+        }
+        assert!(s.contains("Beta datapacks"));
+        for (w, h) in [(60, 20), (20, 8)] {
+            assert!(!render(&a, w, h).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_tutorial_card_shows_the_current_step_with_bound_keys() {
+        let dir = std::env::temp_dir().join(format!("factuio-ui-tut-{}", std::process::id()));
+        let mut a = App::new(dir.join("save.json"), None, false);
+        let mut set = crate::settings::Settings::default();
+        set.keys.insert("mine".into(), "k".into());
+        a.apply_settings(set);
+        a.new_scenario(crate::scenario::Scenario::by_id("tutorial").unwrap());
+        a.game.as_mut().unwrap().tutorial = Some(crate::scenario::Tutorial { step: 1, since: 0 });
+        let s = render(&a, 130, 40);
+        assert!(s.contains("Tutorial 2/"));
+        assert!(s.contains("Press k with"), "{s}");
+        for (w, h) in [(60, 20), (20, 8)] {
+            assert!(!render(&a, w, h).is_empty());
+        }
+        // Hidden behind other screens, and once it's finished.
+        a.modal = Modal::Stats;
+        assert!(!render(&a, 130, 40).contains("Tutorial 2/"));
+        a.modal = Modal::None;
+        a.game.as_mut().unwrap().tutorial = Some(crate::scenario::Tutorial { step: 99, since: 0 });
+        assert!(!render(&a, 130, 40).contains("Tutorial 1"));
+    }
+
+    #[test]
+    fn fog_rails_and_carts_draw() {
+        for ascii in [false, true] {
+            let mut a = app();
+            a.ascii = ascii;
+            let g = a.game.as_mut().unwrap();
+            g.world = crate::world::World::empty(40, 20, 1);
+            g.player.cursor = (10, 5);
+            let w = &mut g.world;
+            w.place(4, 5, EntityKind::Depot, Dir::North).unwrap();
+            for x in 5..=10 {
+                w.place(x, 5, EntityKind::Rail, Dir::North).unwrap();
+            }
+            for y in 6..=8 {
+                w.place(10, y, EntityKind::Rail, Dir::North).unwrap();
+            }
+            w.place(10, 9, EntityKind::Depot, Dir::North).unwrap();
+            w.add_cart(4, 5).unwrap();
+            w.carts[0].cargo.add(Item::Glass, 3);
+            for x in 25..40 {
+                for y in 0..20 {
+                    let i = w.idx(x, y).unwrap();
+                    w.explored[i] = false;
+                }
+            }
+            let s = render(&a, 120, 30);
+            if ascii {
+                assert!(s.contains("Og"), "cart with glass");
+                assert!(s.contains("=="));
+            } else {
+                assert!(s.contains("■g"), "cart with glass");
+                assert!(s.contains("═══"));
+                assert!(s.contains("╗") && s.contains("║"));
+                assert!(s.contains("░░"));
+            }
+            assert!(s.contains("R+"));
+            a.game.as_mut().unwrap().player.cursor = (30, 5);
+            assert!(render(&a, 120, 30).contains("Unexplored"));
+            a.game.as_mut().unwrap().player.cursor = (4, 5);
+            let s = render(&a, 120, 30);
+            assert!(s.contains("Rail cart") && s.contains("Carts load here"));
+            a.modal = Modal::Entity {
+                x: 4,
+                y: 5,
+                sub: EntitySub::Main,
+                sel: 0,
+            };
+            assert!(render(&a, 120, 30).contains("switch loading"));
+            a.modal = Modal::Minimap;
+            assert!(render(&a, 120, 30).contains("explored"));
+        }
+    }
+
+    #[test]
+    fn a_challenge_win_says_so() {
+        let mut a = app();
+        let g = a.game.as_mut().unwrap();
+        g.world.scenario = crate::scenario::Scenario::by_id("sprint").unwrap();
+        g.world.won = true;
+        g.world.won_at = Some(20 * 60 * 12);
+        a.modal = Modal::Victory;
+        a.last_win = Some(crate::records::Placing {
+            ticks: 100,
+            prev_seed_best: Some(200),
+            prev_best: Some(200),
+        });
+        let s = render(&a, 120, 40);
+        assert!(s.contains("Challenge complete"));
+        assert!(s.contains("New personal best"));
+        assert!(!s.contains("on this seed"));
+        a.modal = Modal::None;
+        assert!(render(&a, 160, 40).contains("Sprint"));
     }
 }

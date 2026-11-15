@@ -38,6 +38,8 @@ pub enum Item {
     DeltaPack,
     // Tools
     Landfill,
+    /// A rail cart: put it on a depot or a rail.
+    Cart,
     // Buildings
     Digger,
     Bore,
@@ -63,10 +65,13 @@ pub enum Item {
     Sifter,
     ChemPlant,
     BatteryBank,
+    Rail,
+    Depot,
+    SurveyMast,
 }
 
 impl Item {
-    pub const ALL: [Item; 50] = [
+    pub const ALL: [Item; 54] = [
         Item::FerriteOre,
         Item::MalachiteOre,
         Item::Lignite,
@@ -93,6 +98,7 @@ impl Item {
         Item::GammaPack,
         Item::DeltaPack,
         Item::Landfill,
+        Item::Cart,
         Item::Digger,
         Item::Bore,
         Item::Kiln,
@@ -117,6 +123,9 @@ impl Item {
         Item::Sifter,
         Item::ChemPlant,
         Item::BatteryBank,
+        Item::Rail,
+        Item::Depot,
+        Item::SurveyMast,
     ];
 
     pub fn name(self) -> &'static str {
@@ -133,6 +142,10 @@ impl Item {
             Item::ProductivityModule => "Productivity module",
             Item::DeltaPack => "Delta datapack",
             Item::Landfill => "Landfill",
+            Item::Cart => "Rail cart",
+            Item::Rail => "Rail",
+            Item::Depot => "Depot",
+            Item::SurveyMast => "Survey mast",
             Item::Pump => "Pump",
             Item::SteamTurbine => "Steam turbine",
             Item::Sifter => "Sifter",
@@ -231,11 +244,11 @@ impl Item {
         matches!(self, Item::SpeedModule | Item::ProductivityModule)
     }
 
-    /// Items that can be put down on the map: buildings, plus landfill.
+    /// Items that can be put down on the map: buildings, plus landfill and rail carts.
     pub fn placeable() -> impl Iterator<Item = Item> {
         EntityKind::menu()
             .map(EntityKind::item)
-            .chain(std::iter::once(Item::Landfill))
+            .chain([Item::Landfill, Item::Cart])
     }
 
     pub fn building(self) -> Option<EntityKind> {
@@ -274,10 +287,16 @@ pub enum EntityKind {
     Sifter,
     ChemPlant,
     BatteryBank,
+    /// Track for rail carts. Joins up with the rails and depots beside it.
+    Rail,
+    /// A rail stop: a store that carts load from or unload into.
+    Depot,
+    /// Reveals the map around it, further the longer it runs.
+    SurveyMast,
 }
 
 impl EntityKind {
-    pub const ALL: [EntityKind; 25] = [
+    pub const ALL: [EntityKind; 28] = [
         EntityKind::Digger,
         EntityKind::Bore,
         EntityKind::Kiln,
@@ -303,6 +322,9 @@ impl EntityKind {
         EntityKind::Sifter,
         EntityKind::ChemPlant,
         EntityKind::BatteryBank,
+        EntityKind::Rail,
+        EntityKind::Depot,
+        EntityKind::SurveyMast,
     ];
 
     pub fn item(self) -> Item {
@@ -331,6 +353,9 @@ impl EntityKind {
             EntityKind::Sifter => Item::Sifter,
             EntityKind::ChemPlant => Item::ChemPlant,
             EntityKind::BatteryBank => Item::BatteryBank,
+            EntityKind::Rail => Item::Rail,
+            EntityKind::Depot => Item::Depot,
+            EntityKind::SurveyMast => Item::SurveyMast,
         }
     }
 
@@ -377,6 +402,9 @@ impl EntityKind {
             EntityKind::Sifter => "Sift",
             EntityKind::ChemPlant => "Chem",
             EntityKind::BatteryBank => "Batt",
+            EntityKind::Rail => "Rail",
+            EntityKind::Depot => "Depot",
+            EntityKind::SurveyMast => "Mast",
         }
     }
 
@@ -418,6 +446,11 @@ impl EntityKind {
             EntityKind::LongArm => 2,
             _ => 1,
         }
+    }
+
+    /// Tiles a rail cart can run on.
+    pub fn is_track(self) -> bool {
+        matches!(self, EntityKind::Rail | EntityKind::Depot)
     }
 
     pub fn is_miner(self) -> bool {
@@ -490,6 +523,7 @@ impl EntityKind {
             EntityKind::Uplink => 600.0,
             EntityKind::Sifter => 90.0,
             EntityKind::ChemPlant => 120.0,
+            EntityKind::SurveyMast => 50.0,
             _ => 0.0,
         }
     }
@@ -595,6 +629,15 @@ impl EntityKind {
                 "Electric assembler. Choose a recipe and feed it ingredients."
             }
             EntityKind::Uplink => "Feed it 20 relay modules with power to transmit and win.",
+            EntityKind::Rail => {
+                "Track for rail carts. Rails join up with the rails and depots beside them."
+            }
+            EntityKind::Depot => {
+                "A rail stop that stores 800 items. Carts load here, or unload here once you switch it (e, then v). Arms put in and take out."
+            }
+            EntityKind::SurveyMast => {
+                "Electric: reveals the map around it, a little further every couple of seconds, up to 50 tiles."
+            }
         }
     }
 }
