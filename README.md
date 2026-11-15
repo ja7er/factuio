@@ -10,7 +10,11 @@ build the **Uplink array** and feed it 20 relay modules to win.
 
 ## Install and run
 
-You need a recent Rust toolchain (edition 2024, Rust 1.85+).
+Download a prebuilt binary for Linux, macOS or Windows from the
+[Releases page](https://github.com/ja7er/factuio/releases), unpack it and run `factuio`.
+On macOS, if Gatekeeper blocks the unsigned binary, run `xattr -d com.apple.quarantine factuio`.
+
+Or build from source with a recent Rust toolchain (edition 2024, Rust 1.85+):
 
 ```sh
 cargo run --release
