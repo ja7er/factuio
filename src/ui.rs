@@ -139,7 +139,8 @@ fn status_color(s: Status) -> Color {
 type Cell2 = [(char, Rgb, Rgb, bool); 2];
 
 /// The two characters used to draw an entity, with fg/bg colours and bold flag.
-fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb) -> Cell2 {
+/// `transmitted` is the world's Uplink progress, drawn on Uplink arrays.
+fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb, transmitted: u32) -> Cell2 {
     let bg = if e.kind.is_arm() {
         bg_under
     } else {
@@ -251,11 +252,11 @@ fn entity_cells(e: &Entity, ascii: bool, bg_under: Rgb) -> Cell2 {
             };
             [letter('L'), second]
         }
-        State::Uplink { charge, .. } => {
-            let c = if *charge >= UPLINK_GOAL {
+        State::Uplink { .. } => {
+            let c = if transmitted >= UPLINK_GOAL {
                 '!'
             } else {
-                char::from_digit(charge * 10 / UPLINK_GOAL, 10).unwrap_or('0')
+                char::from_digit(transmitted * 10 / UPLINK_GOAL, 10).unwrap_or('0')
             };
             [letter('U'), (c, (255, 240, 120), bg, true)]
         }
@@ -367,7 +368,7 @@ impl Widget for MapView<'_> {
                 };
 
                 if let Some(e) = world.entity(x, y) {
-                    cells = entity_cells(e, ascii, bg);
+                    cells = entity_cells(e, ascii, bg, world.transmitted);
                     bg = cells[0].2;
                 }
 
@@ -391,7 +392,8 @@ impl Widget for MapView<'_> {
                         tint = Some(((255, 220, 80), 0.25));
                     }
                     let (dx, dy) = d.delta();
-                    if k.is_miner() && (x, y) == (cx + dx * 2, cy + dy * 2) {
+                    // Miners drop into the tile right in front of them.
+                    if k.is_miner() && (x, y) == (cx + dx, cy + dy) {
                         tint = Some(((80, 255, 120), 0.3));
                     }
                     if k.is_arm() {
@@ -412,7 +414,7 @@ impl Widget for MapView<'_> {
                         let ok = world.can_place(x, y, k).is_ok()
                             && self.game.player.inventory.count(k.item()) > 0;
                         let g = ghost_entity(k, self.app.place_dir);
-                        cells = entity_cells(&g, ascii, bg);
+                        cells = entity_cells(&g, ascii, bg, world.transmitted);
                         let gbg = if ok { (60, 90, 150) } else { (150, 40, 40) };
                         for c in &mut cells {
                             c.2 = gbg;
@@ -597,6 +599,8 @@ fn draw_game(f: &mut Frame, app: &App, game: &Game) {
         Modal::Menu { sel } => draw_menu(f, *sel),
         Modal::Stats => draw_stats(f, game),
         Modal::Victory => draw_victory(f, game),
+        Modal::Log { scroll } => draw_log(f, game, *scroll),
+        Modal::Confirm { action } => draw_confirm(f, action.question()),
         _ => {}
     }
 }
@@ -877,21 +881,14 @@ fn entity_detail(
             lines.push(Line::from(bar(*progress, 16, ascii)));
             lines.extend(inv_lines(inv, 3));
         }
-        State::Uplink {
-            inv,
-            charge,
-            progress,
-            ..
-        } => {
+        State::Uplink { inv, progress, .. } => {
+            let sent = w.transmitted;
             lines.push(Line::from(format!(
                 "Transmission {}/{}",
-                charge, UPLINK_GOAL
+                sent.min(UPLINK_GOAL),
+                UPLINK_GOAL
             )));
-            lines.push(Line::from(bar(
-                *charge as f32 / UPLINK_GOAL as f32,
-                16,
-                ascii,
-            )));
+            lines.push(Line::from(bar(sent as f32 / UPLINK_GOAL as f32, 16, ascii)));
             lines.push(Line::from(bar(*progress, 16, ascii)));
             lines.push(Line::from(format!(
                 "Relay modules: {}",
@@ -1013,11 +1010,16 @@ fn draw_hotbar(f: &mut Frame, app: &App, game: &Game, area: Rect) {
 
 fn draw_messages(f: &mut Frame, _app: &App, game: &Game, area: Rect) {
     let mut spans = vec![];
-    if let Some(m) = game.messages.last() {
-        spans.push(Span::styled(
-            format!(" {m} "),
-            Style::default().fg(col((255, 230, 150))),
-        ));
+    if let Some(m) = game.status_message() {
+        let style = if m.important {
+            Style::default()
+                .fg(Color::Black)
+                .bg(col((255, 210, 90)))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(col((255, 230, 150)))
+        };
+        spans.push(Span::styled(format!(" {} ", m.text), style));
         spans.push(Span::raw(" "));
     }
     for (k, d) in [
@@ -1026,7 +1028,7 @@ fn draw_messages(f: &mut Frame, _app: &App, game: &Game, area: Rect) {
         ("c", "craft"),
         ("t", "research"),
         ("e", "inspect"),
-        ("m", "mine"),
+        ("l", "log"),
         ("Esc", "menu"),
     ] {
         spans.push(key(k));
@@ -1492,13 +1494,12 @@ fn draw_stats(f: &mut Frame, game: &Game) {
     f.render_widget(block, area);
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
-    let mins = (game.world.tick as f32 / crate::world::TICKS_PER_SEC as f32 / 60.0).max(1.0 / 60.0);
-    let mut l = vec![header("Produced (total, per min)")];
+    let mut l = vec![header("Produced (total, last minute)")];
     for (it, n) in &game.world.produced {
         l.push(Line::from(vec![
             Span::raw(format!("{n:>7} ")),
             item_span(*it),
-            dim(format!(" {:.0}/m", *n as f32 / mins)),
+            dim(format!(" {:.0}/m", game.world.rate_per_min(*it, 60))),
         ]));
     }
     if game.world.produced.is_empty() {
@@ -1535,6 +1536,65 @@ fn draw_stats(f: &mut Frame, game: &Game) {
         crate::recipes::TECHS.len()
     )));
     f.render_widget(Paragraph::new(r), right);
+}
+
+fn draw_log(f: &mut Frame, game: &Game, scroll: u16) {
+    let area = centered(f.area(), 90, f.area().height.saturating_sub(4).max(8));
+    f.render_widget(Clear, area);
+    let block = modal_block("Message log");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let tps = crate::world::TICKS_PER_SEC as u64;
+    let lines: Vec<Line> = game
+        .messages
+        .iter()
+        .map(|m| {
+            let secs = m.tick / tps;
+            let stamp = dim(format!(
+                "{}:{:02}:{:02} ",
+                secs / 3600,
+                (secs / 60) % 60,
+                secs % 60
+            ));
+            let text = if m.important {
+                Span::styled(
+                    m.text.clone(),
+                    Style::default()
+                        .fg(col((255, 220, 120)))
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(m.text.clone())
+            };
+            Line::from(vec![stamp, text])
+        })
+        .collect();
+    let h = inner.height.saturating_sub(1) as usize;
+    // Newest at the bottom; scroll counts lines back from the end.
+    let max_back = lines.len().saturating_sub(h);
+    let back = (scroll as usize).min(max_back);
+    let start = lines.len().saturating_sub(h + back);
+    let shown: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
+    let [body, foot] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    f.render_widget(Paragraph::new(shown), body);
+    f.render_widget(Paragraph::new(dim("↑/↓ scroll · Esc close")), foot);
+}
+
+fn draw_confirm(f: &mut Frame, question: &str) {
+    let area = centered(f.area(), 50, 7);
+    f.render_widget(Clear, area);
+    let block = modal_block("Are you sure?");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let lines = vec![
+        Line::from(question.to_string()),
+        Line::from(""),
+        Line::from(vec![key("y"), dim(" yes   "), key("n"), dim(" no")]),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).centered(),
+        inner,
+    );
 }
 
 fn draw_victory(f: &mut Frame, game: &Game) {
@@ -1594,11 +1654,13 @@ INTERACTING
                          Enter craft 1, f craft 5, F craft max, x cancel
   t                    research tree (Enter to pick what labs work on)
   g                    production statistics
+  l                    message log
 
 GAME
   p pause   f fast-forward (4x)   F5 quick save   F9 quick load
-  Esc menu (save, load, quit). The game autosaves every 5 minutes
-  and when you press Ctrl+C.
+  Esc menu (save, load, quit). The game autosaves every 5 minutes,
+  and when you press Ctrl+C or close the terminal, to a separate
+  autosave file; Continue picks whichever save is newer.
 
 MAP LEGEND
   :: .       ore (brighter = richer). ferrite (blue), malachite (green),
@@ -1727,6 +1789,10 @@ mod tests {
             Modal::Menu { sel: 1 },
             Modal::Stats,
             Modal::Victory,
+            Modal::Log { scroll: 2 },
+            Modal::Confirm {
+                action: crate::app::ConfirmAction::LoadSave,
+            },
         ];
         for m in modals {
             a.modal = m.clone();

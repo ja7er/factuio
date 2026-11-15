@@ -14,6 +14,8 @@ mod world;
 use app::App;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "factuio - a terminal factory-automation game
@@ -95,7 +97,7 @@ fn main() {
     }
     let mut app = App::new(args.save, args.seed, args.ascii);
     if args.cont {
-        if let Err(e) = app.load_game() {
+        if let Err(e) = app.continue_game() {
             eprintln!("{e}");
             std::process::exit(1);
         }
@@ -103,34 +105,95 @@ fn main() {
         app.new_game();
     }
 
+    // Closing the terminal window or `kill` should save, like Ctrl+C does.
+    let stop = Arc::new(AtomicBool::new(false));
+    register_stop_signals(&stop);
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut app);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(&mut terminal, &mut app, &stop)
+    }));
     ratatui::restore();
-    if let Err(e) = result {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // The terminal went away or broke: keep the player's progress.
+            app.autosave();
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        Err(_) => {
+            // Don't overwrite a good save with state from a crash; write a separate file.
+            if let Some(g) = app.game.as_ref() {
+                let path = app.save_path.with_extension("crash.json");
+                if g.save(&path).is_ok() {
+                    eprintln!("factuio crashed. Your game was saved to {}", path.display());
+                }
+            }
+            std::process::exit(101);
+        }
     }
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> std::io::Result<()> {
+#[cfg(unix)]
+fn register_stop_signals(stop: &Arc<AtomicBool>) {
+    use signal_hook::consts::{SIGHUP, SIGTERM};
+    for sig in [SIGHUP, SIGTERM] {
+        let _ = signal_hook::flag::register(sig, Arc::clone(stop));
+    }
+}
+
+#[cfg(not(unix))]
+fn register_stop_signals(_stop: &Arc<AtomicBool>) {}
+
+/// Reads terminal events on their own thread. crossterm can spin forever inside
+/// `poll`/`read` once the terminal is gone, so the game loop must never block on it.
+fn spawn_input_thread() -> mpsc::Receiver<std::io::Result<Event>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            let ev = event::read();
+            let failed = ev.is_err();
+            if tx.send(ev).is_err() || failed {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    stop: &AtomicBool,
+) -> std::io::Result<()> {
     let tick = Duration::from_millis(1000 / world::TICKS_PER_SEC as u64);
     let mut next_tick = Instant::now() + tick;
     let mut redraw = true;
+    let input = spawn_input_thread();
     while !app.quit {
+        if stop.load(Ordering::Relaxed) {
+            app.autosave();
+            break;
+        }
         if redraw {
             terminal.draw(|f| ui::draw(f, app))?;
             redraw = false;
         }
         let now = Instant::now();
         let timeout = next_tick.saturating_duration_since(now);
-        if event::poll(timeout)? {
-            match event::read()? {
+        match input.recv_timeout(timeout) {
+            Ok(ev) => match ev? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     app.handle_key(k);
                     redraw = true;
                 }
                 Event::Resize(..) => redraw = true,
                 _ => {}
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::other("terminal input closed"));
             }
         }
         let now = Instant::now();
