@@ -1438,8 +1438,11 @@ impl World {
             *progress = 0.0;
             packs.clear();
             if let Some(done) = self.research.add_unit() {
-                self.events
-                    .push(format!("Research complete: {}", done.get().name));
+                let mut msg = format!("Research complete: {}", done.get().name);
+                if let Some(next) = self.research.current {
+                    msg.push_str(&format!(". Now researching {}", next.get().name));
+                }
+                self.events.push(msg);
             }
         }
         e.status = status;

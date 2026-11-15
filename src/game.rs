@@ -3,7 +3,7 @@
 use crate::inventory::Inventory;
 use crate::items::{Dir, EntityKind, Item};
 use crate::recipes::{Category, RecipeId, TechId};
-use crate::world::{State, TICKS_PER_SEC, World, WorldSave};
+use crate::world::{Entity, State, TICKS_PER_SEC, World, WorldSave};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
@@ -216,6 +216,57 @@ impl Game {
         self.world.place(x, y, kind, dir)?;
         self.player.inventory.remove(item, 1);
         Ok(())
+    }
+
+    /// Swaps the building at (x, y) for `item` from the same family (conveyor → express, kiln →
+    /// arc furnace, ...). The old building and its contents go back to the inventory; belt items stay
+    /// on the belt. Returns the old entity.
+    pub fn replace(&mut self, x: i32, y: i32, item: Item, dir: Dir) -> Result<Entity, String> {
+        let kind = item
+            .building()
+            .ok_or_else(|| format!("{} can't be placed", item.name()))?;
+        let old = self.world.entity(x, y).ok_or("Nothing to replace here")?;
+        if old.kind == kind || old.kind.family().is_none() || old.kind.family() != kind.family() {
+            return Err(format!(
+                "Can't put a {} over a {}",
+                kind.name(),
+                old.kind.name()
+            ));
+        }
+        if self.player.inventory.count(item) == 0 {
+            return Err(format!("No {} in inventory", item.name()));
+        }
+        let old = self.world.remove(x, y).expect("checked above");
+        let dir = if kind.is_belt() { dir } else { old.dir };
+        self.world
+            .place(x, y, kind, dir)
+            .expect("the tile was just cleared");
+        self.player.inventory.remove(item, 1);
+        self.player.inventory.add(old.kind.item(), 1);
+        match (
+            &old.state,
+            self.world.entity_mut(x, y).map(|e| &mut e.state),
+        ) {
+            (State::Belt { items }, Some(State::Belt { items: new })) => *new = items.clone(),
+            _ => old.contents().drain_into(&mut self.player.inventory),
+        }
+        Ok(old)
+    }
+
+    /// Buildings that currently report a problem, in map order.
+    pub fn problems(&self) -> Vec<(i32, i32, EntityKind, crate::world::Status)> {
+        self.world
+            .entities
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let e = e.as_ref()?;
+                e.status.is_problem().then(|| {
+                    let (x, y) = self.world.pos(i);
+                    (x, y, e.kind, e.status)
+                })
+            })
+            .collect()
     }
 
     /// Picks up the building at (x, y) along with everything inside it.

@@ -8,6 +8,8 @@ mod items;
 mod playtest;
 mod recipes;
 mod research;
+mod settings;
+mod tools;
 mod ui;
 mod world;
 
@@ -96,6 +98,12 @@ fn main() {
         ui::set_truecolor(c);
     }
     let mut app = App::new(args.save, args.seed, args.ascii);
+    let (settings, warning) = settings::Settings::load_or_create(&app.settings_path());
+    let mouse = settings.mouse;
+    app.apply_settings(settings);
+    if warning.is_some() {
+        app.title_msg = warning;
+    }
     if args.cont {
         if let Err(e) = app.continue_game() {
             eprintln!("{e}");
@@ -110,9 +118,21 @@ fn main() {
     register_stop_signals(&stop);
 
     let mut terminal = ratatui::init();
+    if mouse {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::EnableMouseCapture
+        );
+    }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run(&mut terminal, &mut app, &stop)
     }));
+    if mouse {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::DisableMouseCapture
+        );
+    }
     ratatui::restore();
     match result {
         Ok(Ok(())) => {}
@@ -186,6 +206,10 @@ fn run(
             Ok(ev) => match ev? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => {
                     app.handle_key(k);
+                    redraw = true;
+                }
+                Event::Mouse(m) => {
+                    app.handle_mouse(m);
                     redraw = true;
                 }
                 Event::Resize(..) => redraw = true,
